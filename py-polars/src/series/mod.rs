@@ -5,6 +5,7 @@ mod c_interface;
 mod comparison;
 mod construction;
 mod export;
+mod import;
 mod numpy_ufunc;
 mod scatter;
 
@@ -71,13 +72,17 @@ impl ToPySeries for Vec<Series> {
 impl PySeries {
     fn struct_unnest(&self) -> PyResult<PyDataFrame> {
         let ca = self.series.struct_().map_err(PyPolarsErr::from)?;
-        let df: DataFrame = ca.clone().into();
+        let df: DataFrame = ca.clone().unnest();
         Ok(df.into())
     }
 
     fn struct_fields(&self) -> PyResult<Vec<&str>> {
         let ca = self.series.struct_().map_err(PyPolarsErr::from)?;
-        Ok(ca.fields().iter().map(|s| s.name()).collect())
+        Ok(ca
+            .struct_fields()
+            .iter()
+            .map(|s| s.name().as_str())
+            .collect())
     }
 
     fn is_sorted_ascending_flag(&self) -> bool {
@@ -318,8 +323,8 @@ impl PySeries {
         Ok(self.series.null_count())
     }
 
-    fn has_validity(&self) -> bool {
-        self.series.has_validity()
+    fn has_nulls(&self) -> bool {
+        self.series.has_nulls()
     }
 
     fn equals(

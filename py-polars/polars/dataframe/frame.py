@@ -108,7 +108,7 @@ from polars.schema import Schema
 from polars.selectors import _expand_selector_dicts, _expand_selectors
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
-    from polars.polars import PyDataFrame
+    from polars.polars import PyDataFrame, PySeries
     from polars.polars import dtype_str_repr as _dtype_str_repr
     from polars.polars import write_clipboard_string as _write_clipboard_string
 
@@ -124,7 +124,7 @@ if TYPE_CHECKING:
     import torch
     from great_tables import GT
     from hvplot.plotting.core import hvPlotTabularPolars
-    from xlsxwriter import Workbook
+    from xlsxwriter import Workbook, Worksheet
 
     from polars import DataType, Expr, LazyFrame, Series
     from polars._typing import (
@@ -414,6 +414,21 @@ class DataFrame:
             self._df = dataframe_to_pydf(
                 data, schema=schema, schema_overrides=schema_overrides, strict=strict
             )
+
+        elif hasattr(data, "__arrow_c_array__"):
+            # This uses the fact that PySeries.from_arrow_c_array will create a
+            # struct-typed Series. Then we unpack that to a DataFrame.
+            tmp_col_name = ""
+            s = wrap_s(PySeries.from_arrow_c_array(data))
+            self._df = s.to_frame(tmp_col_name).unnest(tmp_col_name)._df
+
+        elif hasattr(data, "__arrow_c_stream__"):
+            # This uses the fact that PySeries.from_arrow_c_stream will create a
+            # struct-typed Series. Then we unpack that to a DataFrame.
+            tmp_col_name = ""
+            s = wrap_s(PySeries.from_arrow_c_stream(data))
+            self._df = s.to_frame(tmp_col_name).unnest(tmp_col_name)._df
+
         else:
             msg = (
                 f"DataFrame constructor called with unsupported type {type(data).__name__!r}"
@@ -1108,7 +1123,7 @@ class DataFrame:
         other = _prepare_other_arg(other)
         return self._from_pydf(self._df.add(other._s))
 
-    def __radd__(  # type: ignore[misc]
+    def __radd__(
         self, other: DataFrame | Series | int | float | bool | str
     ) -> DataFrame:
         if isinstance(other, str):
@@ -1263,6 +1278,14 @@ class DataFrame:
 
     def _ipython_key_completions_(self) -> list[str]:
         return self.columns
+
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
+        """
+        Export a DataFrame via the Arrow PyCapsule Interface.
+
+        https://arrow.apache.org/docs/dev/format/CDataInterface/PyCapsuleInterface.html
+        """
+        return self._df.__arrow_c_stream__(requested_schema)
 
     def _repr_html_(self, *, _from_series: bool = False) -> str:
         """
@@ -2199,7 +2222,7 @@ class DataFrame:
         dtype: object
         """
         if use_pyarrow_extension_array:
-            if parse_version(pd.__version__) < parse_version("1.5"):
+            if parse_version(pd.__version__) < (1, 5):
                 msg = f'pandas>=1.5.0 is required for `to_pandas("use_pyarrow_extension_array=True")`, found Pandas {pd.__version__!r}'
                 raise ModuleUpgradeRequiredError(msg)
             if not _PYARROW_AVAILABLE or parse_version(pa.__version__) < (8, 0):
@@ -2316,7 +2339,7 @@ class DataFrame:
 
     def to_init_repr(self, n: int = 1000) -> str:
         """
-        Convert DataFrame to instantiatable string representation.
+        Convert DataFrame to instantiable string representation.
 
         Parameters
         ----------
@@ -2779,8 +2802,8 @@ class DataFrame:
 
     def write_excel(
         self,
-        workbook: Workbook | IO[bytes] | Path | str | None = None,
-        worksheet: str | None = None,
+        workbook: str | Workbook | IO[bytes] | Path | None = None,
+        worksheet: str | Worksheet | None = None,
         *,
         position: tuple[int, int] | str = "A1",
         table_style: str | dict[str, Any] | None = None,
@@ -2815,14 +2838,15 @@ class DataFrame:
 
         Parameters
         ----------
-        workbook : Workbook
+        workbook : {str, Workbook}
             String name or path of the workbook to create, BytesIO object to write
             into, or an open `xlsxwriter.Workbook` object that has not been closed.
             If None, writes to a `dataframe.xlsx` workbook in the working directory.
-        worksheet : str
-            Name of target worksheet; if None, writes to "Sheet1" when creating a new
-            workbook (note that writing to an existing workbook requires a valid
-            existing -or new- worksheet name).
+        worksheet : {str, Worksheet}
+            Name of target worksheet or an `xlsxwriter.Worksheet` object (in which
+            case `workbook` must be the parent `xlsxwriter.Workbook` object); if None,
+            writes to "Sheet1" when creating a new workbook (note that writing to an
+            existing workbook requires a valid existing -or new- worksheet name).
         position : {str, tuple}
             Table position in Excel notation (eg: "A1"), or a (row,col) integer tuple.
         table_style : {str, dict}
@@ -2865,13 +2889,13 @@ class DataFrame:
             * If passing a list of colnames, only those given will have a total.
             * For more control, pass a `{colname:funcname,}` dict.
 
-            Valid total function names are "average", "count_nums", "count", "max",
-            "min", "std_dev", "sum", and "var".
+            Valid column-total function names are "average", "count_nums", "count",
+            "max", "min", "std_dev", "sum", and "var".
         column_widths : {dict, int}
             A `{colname:int,}` or `{selector:int,}` dict or a single integer that
             sets (or overrides if autofitting) table column widths, in integer pixel
             units. If given as an integer the same value is used for all table columns.
-        row_totals : {dict, bool}
+        row_totals : {dict, list, bool}
             Add a row-total column to the right-hand side of the exported table.
 
             * If True, a column called "total" will be added at the end of the table
@@ -3131,6 +3155,37 @@ class DataFrame:
         ...     hide_gridlines=True,
         ...     sheet_zoom=125,
         ... )
+
+        Create and reference a Worksheet object directly, adding a basic chart.
+        Taking advantage of structured references to set chart series values and
+        categories is strongly recommended so that you do not have to calculate
+        cell positions with respect to the frame data and worksheet:
+
+        >>> with Workbook("basic_chart.xlsx") as wb:  # doctest: +SKIP
+        ...     # create worksheet object and write frame data to it
+        ...     ws = wb.add_worksheet("demo")
+        ...     df.write_excel(
+        ...         workbook=wb,
+        ...         worksheet=ws,
+        ...         table_name="DataTable",
+        ...         table_style="Table Style Medium 26",
+        ...         hide_gridlines=True,
+        ...     )
+        ...     # create chart object, point to the written table
+        ...     # data using structured references, and style it
+        ...     chart = wb.add_chart({"type": "column"})
+        ...     chart.set_title({"name": "Example Chart"})
+        ...     chart.set_legend({"none": True})
+        ...     chart.set_style(38)
+        ...     chart.add_series(
+        ...         {  # note the use of structured references
+        ...             "values": "=DataTable[points]",
+        ...             "categories": "=DataTable[id]",
+        ...             "data_labels": {"value": True},
+        ...         }
+        ...     )
+        ...     # add chart to the worksheet
+        ...     ws.insert_chart("D1", chart)
         """  # noqa: W505
         from polars.io.spreadsheet._write_utils import (
             _unpack_multi_column_dict,
@@ -3163,6 +3218,7 @@ class DataFrame:
             dtype_formats=dtype_formats,
             header_format=header_format,
             float_precision=float_precision,
+            table_style=table_style,
             row_totals=row_totals,
             sparklines=sparklines,
             formulas=formulas,
@@ -3188,6 +3244,7 @@ class DataFrame:
                 *table_start,
                 *table_finish,
                 {
+                    "data": df.rows(),
                     "style": table_style,
                     "columns": table_columns,
                     "header_row": include_header,
@@ -3197,18 +3254,6 @@ class DataFrame:
                     **table_options,
                 },
             )
-
-            # write data into the table range, column-wise
-            if not is_empty:
-                column_start = [table_start[0] + int(include_header), table_start[1]]
-                for c in df.columns:
-                    if c in self.columns:
-                        ws.write_column(
-                            *column_start,
-                            data=df[c].to_list(),
-                            cell_format=column_formats.get(c),
-                        )
-                    column_start[1] += 1
 
             # apply conditional formats
             if conditional_formats:
@@ -3244,8 +3289,6 @@ class DataFrame:
                     None,
                     options,
                 )
-            elif options:
-                ws.set_column(col_idx, col_idx, None, None, options)
 
         # finally, inject any sparklines into the table
         for column, params in (sparklines or {}).items():
@@ -3446,6 +3489,8 @@ class DataFrame:
         data_page_size: int | None = None,
         use_pyarrow: bool = False,
         pyarrow_options: dict[str, Any] | None = None,
+        partition_by: str | Sequence[str] | None = None,
+        partition_chunk_size_bytes: int = 4_294_967_296,
     ) -> None:
         """
         Write to Apache Parquet file.
@@ -3454,6 +3499,7 @@ class DataFrame:
         ----------
         file
             File path or writable file-like object to which the result will be written.
+            This should be a path to a directory if writing a partitioned dataset.
         compression : {'lz4', 'uncompressed', 'snappy', 'gzip', 'lzo', 'brotli', 'zstd'}
             Choose "zstd" for good compression performance.
             Choose "lz4" for fast compression/decompression.
@@ -3497,6 +3543,14 @@ class DataFrame:
             using `pyarrow.parquet.write_to_dataset`.
             The `partition_cols` parameter leads to write the dataset to a directory.
             Similar to Spark's partitioned datasets.
+        partition_by
+            Column(s) to partition by. A partitioned dataset will be written if this is
+            specified. This parameter is considered unstable and is subject to change.
+        partition_chunk_size_bytes
+            Approximate size to split DataFrames within a single partition when
+            writing. Note this is calculated using the size of the DataFrame in
+            memory - the size of the output file may differ depending on the
+            file format / compression.
 
         Examples
         --------
@@ -3528,7 +3582,11 @@ class DataFrame:
         if compression is None:
             compression = "uncompressed"
         if isinstance(file, (str, Path)):
-            if pyarrow_options is not None and pyarrow_options.get("partition_cols"):
+            if (
+                partition_by is not None
+                or pyarrow_options is not None
+                and pyarrow_options.get("partition_cols")
+            ):
                 file = normalize_filepath(file, check_not_directory=False)
             else:
                 file = normalize_filepath(file)
@@ -3594,6 +3652,13 @@ class DataFrame:
                     "null_count": True,
                 }
 
+            if partition_by is not None:
+                msg = "The `partition_by` parameter of `write_parquet` is considered unstable."
+                issue_unstable_warning(msg)
+
+            if isinstance(partition_by, str):
+                partition_by = [partition_by]
+
             self._df.write_parquet(
                 file,
                 compression,
@@ -3601,99 +3666,9 @@ class DataFrame:
                 statistics,
                 row_group_size,
                 data_page_size,
+                partition_by=partition_by,
+                partition_chunk_size_bytes=partition_chunk_size_bytes,
             )
-
-    @unstable()
-    def write_parquet_partitioned(
-        self,
-        path: str | Path,
-        partition_by: str | Collection[str],
-        *,
-        chunk_size_bytes: int = 4_294_967_296,
-        compression: ParquetCompression = "zstd",
-        compression_level: int | None = None,
-        statistics: bool | str | dict[str, bool] = True,
-        row_group_size: int | None = None,
-        data_page_size: int | None = None,
-    ) -> None:
-        """
-        Write a partitioned directory of parquet files.
-
-        Parameters
-        ----------
-        path
-            Path to the base directory for the partitioned dataset.
-        partition_by
-            Columns to partition by.
-        chunk_size_bytes
-            Approximate size to split DataFrames within a single partition when
-            writing. Note this is calculated using the size of the DataFrame in
-            memory - the size of the output file may differ depending on the
-            file format / compression.
-        compression : {'lz4', 'uncompressed', 'snappy', 'gzip', 'lzo', 'brotli', 'zstd'}
-            Choose "zstd" for good compression performance.
-            Choose "lz4" for fast compression/decompression.
-            Choose "snappy" for more backwards compatibility guarantees
-            when you deal with older parquet readers.
-        compression_level
-            The level of compression to use. Higher compression means smaller files on
-            disk.
-
-            - "gzip" : min-level: 0, max-level: 10.
-            - "brotli" : min-level: 0, max-level: 11.
-            - "zstd" : min-level: 1, max-level: 22.
-
-        statistics
-            Write statistics to the parquet headers. This is the default behavior.
-
-            Possible values:
-
-            - `True`: enable default set of statistics (default)
-            - `False`: disable all statistics
-            - "full": calculate and write all available statistics. Cannot be
-              combined with `use_pyarrow`.
-            - `{ "statistic-key": True / False, ... }`. Cannot be combined with
-              `use_pyarrow`. Available keys:
-
-              - "min": column minimum value (default: `True`)
-              - "max": column maximum value (default: `True`)
-              - "distinct_count": number of unique column values (default: `False`)
-              - "null_count": number of null values in column (default: `True`)
-        row_group_size
-            Size of the row groups in number of rows. Defaults to 512^2 rows.
-        data_page_size
-            Size of the data page in bytes. Defaults to 1024^2 bytes.
-        """
-        path = normalize_filepath(path, check_not_directory=False)
-        partition_by = [partition_by] if isinstance(partition_by, str) else partition_by
-
-        if isinstance(statistics, bool) and statistics:
-            statistics = {
-                "min": True,
-                "max": True,
-                "distinct_count": False,
-                "null_count": True,
-            }
-        elif isinstance(statistics, bool) and not statistics:
-            statistics = {}
-        elif statistics == "full":
-            statistics = {
-                "min": True,
-                "max": True,
-                "distinct_count": True,
-                "null_count": True,
-            }
-
-        self._df.write_parquet_partitioned(
-            path,
-            partition_by,
-            chunk_size_bytes,
-            compression,
-            compression_level,
-            statistics,
-            row_group_size,
-            data_page_size,
-        )
 
     def write_database(
         self,
@@ -3874,7 +3849,7 @@ class DataFrame:
 
             import_optional(
                 module_name="sqlalchemy",
-                min_version=("2.0" if pd_version >= parse_version("2.2") else "1.4"),
+                min_version=("2.0" if pd_version >= (2, 2) else "1.4"),
                 min_err_prefix="pandas >= 2.2 requires",
             )
             # note: the catalog (database) should be a part of the connection string
@@ -4449,28 +4424,39 @@ class DataFrame:
             Each constraint will behave the same as `pl.col(name).eq(value)`, and
             will be implicitly joined with the other filter conditions using `&`.
 
+        Notes
+        -----
+        If you are transitioning from pandas and performing filter operations based on
+        the comparison of two or more columns, please note that in Polars,
+        any comparison involving null values will always result in null.
+        As a result, these rows will be filtered out.
+        Ensure to handle null values appropriately to avoid unintended filtering
+        (See examples below).
+
+
         Examples
         --------
         >>> df = pl.DataFrame(
         ...     {
-        ...         "foo": [1, 2, 3],
-        ...         "bar": [6, 7, 8],
-        ...         "ham": ["a", "b", "c"],
+        ...         "foo": [1, 2, 3, None, 4, None, 0],
+        ...         "bar": [6, 7, 8, None, None, 9, 0],
+        ...         "ham": ["a", "b", "c", None, "d", "e", "f"],
         ...     }
         ... )
 
         Filter on one condition:
 
         >>> df.filter(pl.col("foo") > 1)
-        shape: (2, 3)
-        ┌─────┬─────┬─────┐
-        │ foo ┆ bar ┆ ham │
-        │ --- ┆ --- ┆ --- │
-        │ i64 ┆ i64 ┆ str │
-        ╞═════╪═════╪═════╡
-        │ 2   ┆ 7   ┆ b   │
-        │ 3   ┆ 8   ┆ c   │
-        └─────┴─────┴─────┘
+        shape: (3, 3)
+        ┌─────┬──────┬─────┐
+        │ foo ┆ bar  ┆ ham │
+        │ --- ┆ ---  ┆ --- │
+        │ i64 ┆ i64  ┆ str │
+        ╞═════╪══════╪═════╡
+        │ 2   ┆ 7    ┆ b   │
+        │ 3   ┆ 8    ┆ c   │
+        │ 4   ┆ null ┆ d   │
+        └─────┴──────┴─────┘
 
         Filter on multiple conditions, combined with and/or operators:
 
@@ -4501,13 +4487,14 @@ class DataFrame:
         ...     pl.col("foo") <= 2,
         ...     ~pl.col("ham").is_in(["b", "c"]),
         ... )
-        shape: (1, 3)
+        shape: (2, 3)
         ┌─────┬─────┬─────┐
         │ foo ┆ bar ┆ ham │
         │ --- ┆ --- ┆ --- │
         │ i64 ┆ i64 ┆ str │
         ╞═════╪═════╪═════╡
         │ 1   ┆ 6   ┆ a   │
+        │ 0   ┆ 0   ┆ f   │
         └─────┴─────┴─────┘
 
         Provide multiple filters using `**kwargs` syntax:
@@ -4521,6 +4508,48 @@ class DataFrame:
         ╞═════╪═════╪═════╡
         │ 2   ┆ 7   ┆ b   │
         └─────┴─────┴─────┘
+
+        Filter by comparing two columns against each other
+
+        >>> df.filter(pl.col("foo") == pl.col("bar"))
+        shape: (1, 3)
+        ┌─────┬─────┬─────┐
+        │ foo ┆ bar ┆ ham │
+        │ --- ┆ --- ┆ --- │
+        │ i64 ┆ i64 ┆ str │
+        ╞═════╪═════╪═════╡
+        │ 0   ┆ 0   ┆ f   │
+        └─────┴─────┴─────┘
+
+        >>> df.filter(pl.col("foo") != pl.col("bar"))
+        shape: (3, 3)
+        ┌─────┬─────┬─────┐
+        │ foo ┆ bar ┆ ham │
+        │ --- ┆ --- ┆ --- │
+        │ i64 ┆ i64 ┆ str │
+        ╞═════╪═════╪═════╡
+        │ 1   ┆ 6   ┆ a   │
+        │ 2   ┆ 7   ┆ b   │
+        │ 3   ┆ 8   ┆ c   │
+        └─────┴─────┴─────┘
+
+        Notice how the row with `None` values is filtered out. In order to keep the
+        same behavior as pandas, use:
+
+        >>> df.filter(pl.col("foo").ne_missing(pl.col("bar")))
+        shape: (5, 3)
+        ┌──────┬──────┬─────┐
+        │ foo  ┆ bar  ┆ ham │
+        │ ---  ┆ ---  ┆ --- │
+        │ i64  ┆ i64  ┆ str │
+        ╞══════╪══════╪═════╡
+        │ 1    ┆ 6    ┆ a   │
+        │ 2    ┆ 7    ┆ b   │
+        │ 3    ┆ 8    ┆ c   │
+        │ 4    ┆ null ┆ d   │
+        │ null ┆ 9    ┆ e   │
+        └──────┴──────┴─────┘
+
         """
         return self.lazy().filter(*predicates, **constraints).collect(_eager=True)
 
@@ -4757,6 +4786,8 @@ class DataFrame:
         ... )
         >>> df.get_column_index("ham")
         2
+        >>> df.get_column_index("sandwich")  # doctest: +SKIP
+        ColumnNotFoundError: sandwich
         """
         return self._df.get_column_index(name)
 
@@ -4815,8 +4846,8 @@ class DataFrame:
         Parameters
         ----------
         by
-            Column(s) to sort by. Accepts expression input. Strings are parsed as column
-            names.
+            Column(s) to sort by. Accepts expression input, including selectors. Strings
+            are parsed as column names.
         *more_by
             Additional columns to sort by, specified as positional arguments.
         descending
@@ -5809,6 +5840,16 @@ class DataFrame:
         │ c   ┆ 3   ┆ 1   │
         └─────┴─────┴─────┘
         """
+        for _key, value in named_by.items():
+            if not isinstance(value, (str, pl.Expr, pl.Series)):
+                msg = (
+                    f"Expected Polars expression or object convertible to one, got {type(value)}.\n\n"
+                    "Hint: if you tried\n"
+                    f"    group_by(by={value!r})\n"
+                    "then you probably want to use this instead:\n"
+                    f"    group_by({value!r})"
+                )
+                raise TypeError(msg)
         return GroupBy(self, *by, **named_by, maintain_order=maintain_order)
 
     @deprecate_renamed_parameter("by", "group_by", version="0.20.14")
@@ -6739,13 +6780,13 @@ class DataFrame:
                 Returns all rows from the right table, and the matched rows from the
                 left table
             * *full*
-                 Returns all rows when there is a match in either left or right table
+                Returns all rows when there is a match in either left or right table
             * *cross*
-                 Returns the Cartesian product of rows from both tables
+                Returns the Cartesian product of rows from both tables
             * *semi*
-                 Filter rows that have a match in the right table.
+                Returns rows from the left table that have a match in the right table.
             * *anti*
-                 Filter rows that do not have a match in the right table.
+                Returns rows from the left table that have no match in the right table.
 
             .. note::
                 A left join preserves the row order of the left DataFrame.
@@ -7787,16 +7828,18 @@ class DataFrame:
         Parameters
         ----------
         on
-            Name of the column(s) whose values will be used as the header of the output
+            The column(s) whose values will be used as the new columns of the output
             DataFrame.
         index
-            One or multiple keys to group by. If None, all remaining columns not specified
-            on `on` and `values` will be used. At least one of `index` and `values` must
-            be specified.
+            The column(s) that remain from the input to the output. The output DataFrame will have one row
+            for each unique combination of the `index`'s values.
+            If None, all remaining columns not specified on `on` and `values` will be used. At least one
+            of `index` and `values` must be specified.
         values
-            One or multiple keys to group by. If None, all remaining columns not specified
-            on `on` and `index` will be used. At least one of `index` and `values` must
-            be specified.
+            The existing column(s) of values which will be moved under the new columns from index. If an
+            aggregation is specified, these are the values on which the aggregation will be computed.
+            If None, all remaining columns not specified on `on` and `index` will be used.
+            At least one of `index` and `values` must be specified.
         aggregate_function
             Choose from:
 
@@ -10518,7 +10561,7 @@ class DataFrame:
             {5,"five"}
         ]
         """
-        return wrap_s(self._df.to_struct(name))
+        return wrap_s(self._df.to_struct(name, []))
 
     def unnest(
         self,
@@ -10896,7 +10939,7 @@ class DataFrame:
         measured variables (value_vars), are "unpivoted" to the row axis leaving just
         two non-identifier columns, 'variable' and 'value'.
 
-        .. deprecated 1.0.0
+        .. deprecated:: 1.0.0
             Please use :meth:`.unpivot` instead.
 
         Parameters

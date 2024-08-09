@@ -4,12 +4,12 @@
 
 extern crate core;
 
+#[cfg(feature = "polars_cloud")]
+pub mod client;
 pub mod constants;
 pub mod dsl;
 pub mod frame;
 pub mod global;
 pub mod plans;
 pub mod prelude;
-// Activate later
-// mod reduce;
 pub mod utils;

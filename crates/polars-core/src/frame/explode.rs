@@ -83,7 +83,18 @@ impl DataFrame {
         let check_offsets = || {
             let first_offsets = exploded_columns[0].1.as_slice();
             for (_, offsets) in &exploded_columns[1..] {
-                polars_ensure!(first_offsets == offsets.as_slice(),
+                let offsets = offsets.as_slice();
+
+                let offset_l = first_offsets[0];
+                let offset_r = offsets[0];
+                let all_equal_len = first_offsets.len() != offsets.len() || {
+                    first_offsets
+                        .iter()
+                        .zip(offsets.iter())
+                        .all(|(l, r)| (*l - offset_l) == (*r - offset_r))
+                };
+
+                polars_ensure!(all_equal_len,
                     ShapeMismatch: "exploded columns must have matching element counts"
                 )
             }
@@ -294,18 +305,16 @@ impl DataFrame {
 
         // values will all be placed in single column, so we must find their supertype
         let schema = self.schema();
-        let mut iter = on.iter().map(|v| {
-            schema
-                .get(v)
-                .ok_or_else(|| polars_err!(ColumnNotFound: "{}", v))
-        });
+        let mut iter = on
+            .iter()
+            .map(|v| schema.get(v).ok_or_else(|| polars_err!(col_not_found = v)));
         let mut st = iter.next().unwrap()?.clone();
         for dt in iter {
             st = try_get_supertype(&st, dt?)?;
         }
 
         // The column name of the variable that is unpivoted
-        let mut variable_col = MutableBinaryViewArray::<str>::with_capacity(len * on.len() + 1);
+        let mut variable_col = MutablePlString::with_capacity(len * on.len() + 1);
         // prepare ids
         let ids_ = self.select_with_schema_unchecked(index, &schema)?;
         let mut ids = ids_.clone();

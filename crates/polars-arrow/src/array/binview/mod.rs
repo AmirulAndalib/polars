@@ -26,6 +26,7 @@ mod private {
 }
 pub use iterator::BinaryViewValueIter;
 pub use mutable::MutableBinaryViewArray;
+use polars_utils::aliases::{InitHashMaps, PlHashMap};
 use polars_utils::slice::GetSaferUnchecked;
 use private::Sealed;
 
@@ -231,6 +232,29 @@ impl<T: ViewType + ?Sized> BinaryViewArrayGeneric<T> {
         )
     }
 
+    /// Apply a function over the views. This can be used to update views in operations like slicing.
+    ///
+    /// # Safety
+    /// Update the views. All invariants of the views apply.
+    pub unsafe fn apply_views<F: FnMut(View, &T) -> View>(&self, mut update_view: F) -> Self {
+        let arr = self.clone();
+        let (views, buffers, validity, total_bytes_len, total_buffer_len) = arr.into_inner();
+
+        let mut views = views.make_mut();
+        for v in views.iter_mut() {
+            let str_slice = T::from_bytes_unchecked(v.get_slice_unchecked(&buffers));
+            *v = update_view(*v, str_slice);
+        }
+        Self::new_unchecked(
+            self.data_type.clone(),
+            views.into(),
+            buffers,
+            validity,
+            total_bytes_len,
+            total_buffer_len,
+        )
+    }
+
     pub fn try_new(
         data_type: ArrowDataType,
         views: Buffer<View>,
@@ -353,6 +377,22 @@ impl<T: ViewType + ?Sized> BinaryViewArrayGeneric<T> {
         self.total_buffer_len
     }
 
+    fn total_unshared_buffer_len(&self) -> usize {
+        // XXX: it is O(n), not O(1).
+        // Given this function is only called in `maybe_gc()`,
+        // it may not be worthy to add an extra field for this.
+        self.buffers
+            .iter()
+            .map(|buf| {
+                if buf.shared_count_strong() == 1 {
+                    buf.len()
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.views.len()
@@ -367,7 +407,7 @@ impl<T: ViewType + ?Sized> BinaryViewArrayGeneric<T> {
         let buffers = self.buffers.as_ref();
 
         for view in self.views.as_ref() {
-            unsafe { mutable.push_view(*view, buffers) }
+            unsafe { mutable.push_view_copied_unchecked(*view, buffers) }
         }
         mutable.freeze().with_validity(self.validity)
     }
@@ -383,13 +423,21 @@ impl<T: ViewType + ?Sized> BinaryViewArrayGeneric<T> {
             return self;
         }
 
+        if Arc::strong_count(&self.buffers) != 1 {
+            // There are multiple holders of this `buffers`.
+            // If we allow gc in this case,
+            // it may end up copying the same content multiple times.
+            return self;
+        }
+
         // Subtract the maximum amount of inlined strings to get a lower bound
         // on the number of buffer bytes needed (assuming no dedup).
         let total_bytes_len = self.total_bytes_len();
         let buffer_req_lower_bound = total_bytes_len.saturating_sub(self.len() * 12);
 
         let lower_bound_mem_usage_post_gc = self.len() * 16 + buffer_req_lower_bound;
-        let cur_mem_usage = self.len() * 16 + self.total_buffer_len();
+        // Use unshared buffer len. Shared buffer won't be freed; no savings.
+        let cur_mem_usage = self.len() * 16 + self.total_unshared_buffer_len();
         let savings_upper_bound = cur_mem_usage.saturating_sub(lower_bound_mem_usage_post_gc);
 
         if savings_upper_bound >= GC_MINIMUM_SAVINGS
@@ -413,6 +461,7 @@ impl<T: ViewType + ?Sized> BinaryViewArrayGeneric<T> {
             phantom: Default::default(),
             total_bytes_len: self.total_bytes_len.load(Ordering::Relaxed) as usize,
             total_buffer_len: self.total_buffer_len,
+            stolen_buffers: PlHashMap::new(),
         }
     }
 }
@@ -514,6 +563,13 @@ impl<T: ViewType + ?Sized> Array for BinaryViewArrayGeneric<T> {
     }
 
     fn with_validity(&self, validity: Option<Bitmap>) -> Box<dyn Array> {
+        debug_assert!(
+            validity.as_ref().map_or(true, |v| v.len() == self.len()),
+            "{} != {}",
+            validity.as_ref().unwrap().len(),
+            self.len()
+        );
+
         let mut new = self.clone();
         new.validity = validity;
         Box::new(new)

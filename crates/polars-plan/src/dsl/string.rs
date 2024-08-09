@@ -237,7 +237,7 @@ impl StringNameSpace {
         )
     }
 
-    /// Find the index of a substring defined by a regular expressons within another string value.
+    /// Find the index of a substring defined by a regular expressions within another string value.
     #[cfg(feature = "regex")]
     pub fn find(self, pat: Expr, strict: bool) -> Expr {
         self.0.map_many_private(
@@ -339,7 +339,7 @@ impl StringNameSpace {
                 .into(),
             )
             .with_function_options(|mut options| {
-                options.returns_scalar = true;
+                options.flags |= FunctionFlags::RETURNS_SCALAR;
                 options.collect_groups = ApplyOptions::GroupWise;
                 options
             })

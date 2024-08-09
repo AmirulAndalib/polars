@@ -37,7 +37,7 @@ pub trait ToStruct: AsArray {
                 .collect::<PolarsResult<Vec<_>>>()
         })?;
 
-        StructChunked::new(ca.name(), &fields)
+        StructChunked::from_series(ca.name(), &fields)
     }
 }
 

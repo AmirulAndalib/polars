@@ -11,12 +11,12 @@ use polars_io::parquet::read::ParquetReader;
 #[cfg(all(feature = "parquet", feature = "async"))]
 use polars_io::pl_async::{get_runtime, with_concurrency_budget};
 #[cfg(any(feature = "parquet", feature = "ipc"))]
-use polars_io::{utils::is_cloud_url, SerReader};
+use polars_io::{path_utils::is_cloud_url, SerReader};
 
 use super::*;
 
 #[allow(unused_variables)]
-pub fn count_rows(paths: &Arc<[PathBuf]>, scan_type: &FileScan) -> PolarsResult<DataFrame> {
+pub fn count_rows(paths: &Arc<Vec<PathBuf>>, scan_type: &FileScan) -> PolarsResult<DataFrame> {
     #[cfg(not(any(
         feature = "parquet",
         feature = "ipc",
@@ -72,7 +72,10 @@ pub fn count_rows(paths: &Arc<[PathBuf]>, scan_type: &FileScan) -> PolarsResult<
                 metadata.as_ref(),
             ),
             #[cfg(feature = "json")]
-            FileScan::NDJson { options } => count_rows_ndjson(paths),
+            FileScan::NDJson {
+                options,
+                cloud_options,
+            } => count_rows_ndjson(paths, cloud_options.as_ref()),
             FileScan::Anonymous { .. } => {
                 unreachable!()
             },
@@ -86,7 +89,7 @@ pub fn count_rows(paths: &Arc<[PathBuf]>, scan_type: &FileScan) -> PolarsResult<
 }
 #[cfg(feature = "parquet")]
 pub(super) fn count_rows_parquet(
-    paths: &Arc<[PathBuf]>,
+    paths: &Arc<Vec<PathBuf>>,
     cloud_options: Option<&CloudOptions>,
 ) -> PolarsResult<usize> {
     if paths.is_empty() {
@@ -116,7 +119,7 @@ pub(super) fn count_rows_parquet(
 
 #[cfg(all(feature = "parquet", feature = "async"))]
 async fn count_rows_cloud_parquet(
-    paths: &Arc<[PathBuf]>,
+    paths: &Arc<Vec<PathBuf>>,
     cloud_options: Option<&CloudOptions>,
 ) -> PolarsResult<usize> {
     let collection = paths.iter().map(|path| {
@@ -133,7 +136,7 @@ async fn count_rows_cloud_parquet(
 
 #[cfg(feature = "ipc")]
 pub(super) fn count_rows_ipc(
-    paths: &Arc<[PathBuf]>,
+    paths: &Arc<Vec<PathBuf>>,
     #[cfg(feature = "cloud")] cloud_options: Option<&CloudOptions>,
     metadata: Option<&arrow::io::ipc::read::FileMetadata>,
 ) -> PolarsResult<usize> {
@@ -163,7 +166,7 @@ pub(super) fn count_rows_ipc(
 
 #[cfg(all(feature = "ipc", feature = "async"))]
 async fn count_rows_cloud_ipc(
-    paths: &Arc<[PathBuf]>,
+    paths: &Arc<Vec<PathBuf>>,
     cloud_options: Option<&CloudOptions>,
     metadata: Option<&arrow::io::ipc::read::FileMetadata>,
 ) -> PolarsResult<usize> {
@@ -181,11 +184,56 @@ async fn count_rows_cloud_ipc(
 }
 
 #[cfg(feature = "json")]
-pub(super) fn count_rows_ndjson(paths: &Arc<[PathBuf]>) -> PolarsResult<usize> {
-    paths
-        .iter()
-        .map(|path| {
-            let reader = polars_io::ndjson::core::JsonLineReader::from_path(path)?;
+pub(super) fn count_rows_ndjson(
+    paths: &Arc<Vec<PathBuf>>,
+    cloud_options: Option<&CloudOptions>,
+) -> PolarsResult<usize> {
+    use polars_core::config;
+
+    let run_async = !paths.is_empty() && is_cloud_url(&paths[0]) || config::force_async();
+
+    let cache_entries = {
+        #[cfg(feature = "cloud")]
+        {
+            if run_async {
+                Some(polars_io::file_cache::init_entries_from_uri_list(
+                    paths
+                        .iter()
+                        .map(|path| Arc::from(path.to_str().unwrap()))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    cloud_options,
+                )?)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "cloud"))]
+        {
+            if run_async {
+                panic!("required feature `cloud` is not enabled")
+            }
+        }
+    };
+
+    (0..paths.len())
+        .map(|i| {
+            let f = if run_async {
+                #[cfg(feature = "cloud")]
+                {
+                    let entry: &Arc<polars_io::file_cache::FileCacheEntry> =
+                        &cache_entries.as_ref().unwrap()[0];
+                    entry.try_open_check_latest()?
+                }
+                #[cfg(not(feature = "cloud"))]
+                {
+                    panic!("required feature `cloud` is not enabled")
+                }
+            } else {
+                polars_utils::open_file(&paths[i])?
+            };
+
+            let reader = polars_io::ndjson::core::JsonLineReader::new(f);
             reader.count()
         })
         .sum()

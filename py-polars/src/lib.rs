@@ -13,6 +13,8 @@ mod build {
 mod allocator;
 #[cfg(feature = "csv")]
 mod batched_csv;
+#[cfg(feature = "polars_cloud")]
+mod cloud;
 mod conversion;
 mod dataframe;
 mod datatypes;
@@ -42,6 +44,7 @@ mod utils;
 use pyo3::prelude::*;
 use pyo3::{wrap_pyfunction, wrap_pymodule};
 
+use crate::allocator::create_allocator_capsule;
 #[cfg(feature = "csv")]
 use crate::batched_csv::PyBatchedCsv;
 use crate::conversion::Wrap;
@@ -402,14 +405,23 @@ fn polars(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     )
     .unwrap();
 
+    // Cloud
+    #[cfg(feature = "polars_cloud")]
+    m.add_wrapped(wrap_pyfunction!(cloud::prepare_cloud_plan))
+        .unwrap();
+
     // Build info
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     #[cfg(feature = "build_info")]
     add_build_info(py, m)?;
 
     // Plugins
+    #[cfg(feature = "ffi_plugin")]
     m.add_wrapped(wrap_pyfunction!(functions::register_plugin_function))
         .unwrap();
+
+    // Capsules
+    m.add("_allocator", create_allocator_capsule(py)?)?;
 
     Ok(())
 }

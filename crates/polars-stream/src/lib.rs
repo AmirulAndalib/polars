@@ -1,17 +1,16 @@
-#![allow(unused)] // TODO: remove.
-
 mod async_executor;
-#[allow(unused)] // TODO: remove.
 mod async_primitives;
 mod skeleton;
 
 pub use skeleton::run_query;
 
 mod execute;
+pub(crate) mod expression;
 mod graph;
 mod morsel;
 mod nodes;
 mod physical_plan;
+mod pipe;
 mod utils;
 
 // TODO: experiment with these, and make them configurable through environment variables.

@@ -231,7 +231,7 @@ pub trait SeriesTrait:
 
     /// Shrink the capacity of this array to fit its length.
     fn shrink_to_fit(&mut self) {
-        invalid_operation_panic!(shrink_to_fit, self);
+        // no-op
     }
 
     /// Take `num_elements` from the top as a zero copy view.
@@ -364,9 +364,8 @@ pub trait SeriesTrait:
     /// Count the null values.
     fn null_count(&self) -> usize;
 
-    /// Return if any the chunks in this `[ChunkedArray]` have a validity bitmap.
-    /// no bitmap means no null values.
-    fn has_validity(&self) -> bool;
+    /// Return if any the chunks in this `[ChunkedArray]` have nulls.
+    fn has_nulls(&self) -> bool;
 
     /// Get unique values in the Series.
     fn unique(&self) -> PolarsResult<Series> {

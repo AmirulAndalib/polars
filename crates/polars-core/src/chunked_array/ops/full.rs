@@ -189,7 +189,7 @@ impl ListChunked {
 impl ChunkFullNull for StructChunked {
     fn full_null(name: &str, length: usize) -> StructChunked {
         let s = vec![Series::new_null("", length)];
-        StructChunked::new_unchecked(name, &s)
+        StructChunked::from_series(name, &s).unwrap()
     }
 }
 

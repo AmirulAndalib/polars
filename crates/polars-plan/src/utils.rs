@@ -76,19 +76,6 @@ pub(crate) fn aexpr_is_simple_projection(current_node: Node, arena: &Arena<AExpr
         .all(|(_node, e)| matches!(e, AExpr::Column(_) | AExpr::Alias(_, _)))
 }
 
-pub(crate) fn single_aexpr_is_elementwise(ae: &AExpr) -> bool {
-    use AExpr::*;
-    match ae {
-        AnonymousFunction { options, .. } | Function { options, .. } => {
-            !matches!(options.collect_groups, ApplyOptions::GroupWise)
-        },
-        Column(_) | Alias(_, _) | Literal(_) | BinaryExpr { .. } | Ternary { .. } | Cast { .. } => {
-            true
-        },
-        _ => false,
-    }
-}
-
 pub fn has_aexpr<F>(current_node: Node, arena: &Arena<AExpr>, matches: F) -> bool
 where
     F: Fn(&AExpr) -> bool,
@@ -126,7 +113,7 @@ pub(crate) fn has_leaf_literal(e: &Expr) -> bool {
 pub(crate) fn all_return_scalar(e: &Expr) -> bool {
     match e {
         Expr::Literal(lv) => lv.projects_as_scalar(),
-        Expr::Function { options: opt, .. } => opt.returns_scalar,
+        Expr::Function { options: opt, .. } => opt.flags.contains(FunctionFlags::RETURNS_SCALAR),
         Expr::Agg(_) => true,
         Expr::Column(_) | Expr::Wildcard => false,
         _ => {
@@ -278,7 +265,7 @@ pub(crate) fn rename_matching_aexpr_leaf_names(
             Expr::Column(name) if &*name == current => Expr::Column(ColumnName::from(new_name)),
             e => e,
         });
-        to_aexpr(new_expr, arena)
+        to_aexpr(new_expr, arena).expect("infallible")
     } else {
         node
     }

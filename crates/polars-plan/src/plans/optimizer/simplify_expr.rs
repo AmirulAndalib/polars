@@ -413,8 +413,9 @@ fn string_addition_to_linear_concat(
                     .into(),
                     options: FunctionOptions {
                         collect_groups: ApplyOptions::ElementWise,
-                        input_wildcard_expansion: true,
-                        returns_scalar: false,
+                        flags: FunctionFlags::default()
+                            | FunctionFlags::INPUT_WILDCARD_EXPANSION
+                                & !FunctionFlags::RETURNS_SCALAR,
                         ..Default::default()
                     },
                 }),
@@ -630,7 +631,7 @@ fn test_expr_to_aexp() {
 
     let expr = Expr::Literal(LiteralValue::Int8(0));
     let mut arena = Arena::new();
-    let aexpr = to_aexpr(expr, &mut arena);
+    let aexpr = to_aexpr(expr, &mut arena).unwrap();
     assert_eq!(aexpr, Node(0));
     assert!(matches!(
         arena.get(aexpr),

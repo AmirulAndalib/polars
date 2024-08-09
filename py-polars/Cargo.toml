@@ -1,6 +1,6 @@
 [package]
 name = "py-polars"
-version = "1.1.0"
+version = "1.4.1"
 edition = "2021"
 
 [lib]
@@ -23,6 +23,7 @@ polars-stream = { workspace = true }
 
 ahash = { workspace = true }
 arboard = { workspace = true, optional = true }
+bytemuck = { workspace = true }
 ciborium = { workspace = true }
 either = { workspace = true }
 itoa = { workspace = true }
@@ -44,6 +45,7 @@ workspace = true
 features = [
   "abs",
   "approx_unique",
+  "array_any_all",
   "arg_where",
   "business",
   "concat_str",
@@ -63,6 +65,7 @@ features = [
   "ewma",
   "ewma_by",
   "fmt",
+  "fused",
   "interpolate",
   "interpolate_by",
   "is_first_distinct",
@@ -230,6 +233,8 @@ optimizations = [
   "streaming",
 ]
 
+polars_cloud = ["polars/polars_cloud"]
+
 all = [
   "optimizations",
   "io",
@@ -242,6 +247,7 @@ all = [
   "sql",
   "binary_encoding",
   "ffi_plugin",
+  "polars_cloud",
   # "new_streaming",
 ]
 

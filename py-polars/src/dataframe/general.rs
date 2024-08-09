@@ -1,4 +1,5 @@
 use either::Either;
+use polars::export::arrow::bitmap::MutableBitmap;
 use polars::prelude::*;
 use polars_core::frame::*;
 #[cfg(feature = "pivot")]
@@ -225,8 +226,11 @@ impl PyDataFrame {
         }
     }
 
-    pub fn get_column_index(&self, name: &str) -> Option<usize> {
-        self.df.get_column_index(name)
+    pub fn get_column_index(&self, name: &str) -> PyResult<usize> {
+        Ok(self
+            .df
+            .try_get_column_index(name)
+            .map_err(PyPolarsErr::from)?)
     }
 
     pub fn get_column(&self, name: &str) -> PyResult<PySeries> {
@@ -571,9 +575,22 @@ impl PyDataFrame {
         Ok(out.into())
     }
 
-    pub fn to_struct(&self, name: &str) -> PySeries {
-        let s = self.df.clone().into_struct(name);
-        s.into_series().into()
+    pub fn to_struct(&self, name: &str, invalid_indices: Vec<usize>) -> PySeries {
+        let ca = self.df.clone().into_struct(name);
+
+        if !invalid_indices.is_empty() {
+            let mut validity = MutableBitmap::with_capacity(ca.len());
+            validity.extend_constant(ca.len(), true);
+            for i in invalid_indices {
+                validity.set(i, false);
+            }
+            let ca = ca.rechunk();
+            ca.with_outer_validity(Some(validity.freeze()))
+                .into_series()
+                .into()
+        } else {
+            ca.into_series().into()
+        }
     }
 
     pub fn unnest(&self, columns: Vec<String>) -> PyResult<Self> {

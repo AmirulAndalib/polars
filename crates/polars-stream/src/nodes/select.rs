@@ -1,23 +1,18 @@
 use std::sync::Arc;
 
 use polars_core::schema::Schema;
-use polars_core::series::Series;
-use polars_expr::prelude::PhysicalExpr;
 
 use super::compute_node_prelude::*;
+use crate::expression::StreamExpr;
 
 pub struct SelectNode {
-    selectors: Vec<Arc<dyn PhysicalExpr>>,
+    selectors: Vec<StreamExpr>,
     schema: Arc<Schema>,
     extend_original: bool,
 }
 
 impl SelectNode {
-    pub fn new(
-        selectors: Vec<Arc<dyn PhysicalExpr>>,
-        schema: Arc<Schema>,
-        extend_original: bool,
-    ) -> Self {
+    pub fn new(selectors: Vec<StreamExpr>, schema: Arc<Schema>, extend_original: bool) -> Self {
         Self {
             selectors,
             schema,
@@ -37,31 +32,31 @@ impl ComputeNode for SelectNode {
     }
 
     fn spawn<'env, 's>(
-        &'env self,
+        &'env mut self,
         scope: &'s TaskScope<'s, 'env>,
-        _pipeline: usize,
-        recv: &mut [Option<Receiver<Morsel>>],
-        send: &mut [Option<Sender<Morsel>>],
+        recv: &mut [Option<RecvPort<'_>>],
+        send: &mut [Option<SendPort<'_>>],
         state: &'s ExecutionState,
-    ) -> JoinHandle<PolarsResult<()>> {
+        join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
+    ) {
         assert!(recv.len() == 1 && send.len() == 1);
-        let mut recv = recv[0].take().unwrap();
-        let mut send = send[0].take().unwrap();
+        let receivers = recv[0].take().unwrap().parallel();
+        let senders = send[0].take().unwrap().parallel();
 
-        scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = recv.recv().await {
-                let morsel = morsel.try_map(|df| {
-                    // Select columns.
-                    let mut selected: Vec<Series> = self
-                        .selectors
-                        .iter()
-                        .map(|s| s.evaluate(&df, state))
-                        .collect::<PolarsResult<_>>()?;
+        for (mut recv, mut send) in receivers.into_iter().zip(senders) {
+            let slf = &*self;
+            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
+                while let Ok(morsel) = recv.recv().await {
+                    let (df, seq, source_token, consume_token) = morsel.into_inner();
+                    let mut selected = Vec::new();
+                    for selector in slf.selectors.iter() {
+                        let s = selector.evaluate(&df, state).await?;
+                        selected.push(s);
+                    }
 
-                    // Extend or create new dataframe.
-                    let ret = if self.extend_original {
-                        let mut out = df.clone();
-                        out._add_columns(selected, &self.schema)?;
+                    let ret = if slf.extend_original {
+                        let mut out = df;
+                        out._add_columns(selected, &slf.schema)?;
                         out
                     } else {
                         // Broadcast scalars.
@@ -80,15 +75,18 @@ impl ComputeNode for SelectNode {
                         unsafe { DataFrame::new_no_checks(selected) }
                     };
 
-                    PolarsResult::Ok(ret)
-                })?;
+                    let mut morsel = Morsel::new(ret, seq, source_token);
+                    if let Some(token) = consume_token {
+                        morsel.set_consume_token(token);
+                    }
 
-                if send.send(morsel).await.is_err() {
-                    break;
+                    if send.send(morsel).await.is_err() {
+                        break;
+                    }
                 }
-            }
 
-            Ok(())
-        })
+                Ok(())
+            }));
+        }
     }
 }

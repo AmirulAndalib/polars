@@ -125,8 +125,8 @@ impl<'a> AnyValueBuffer<'a> {
 
             // dynamic types
             (String(builder), av) => match av {
-                AnyValue::Int64(v) => builder.append_value(&format!("{v}")),
-                AnyValue::Float64(v) => builder.append_value(&format!("{v}")),
+                AnyValue::Int64(v) => builder.append_value(format!("{v}")),
+                AnyValue::Float64(v) => builder.append_value(format!("{v}")),
                 AnyValue::Boolean(true) => builder.append_value("true"),
                 AnyValue::Boolean(false) => builder.append_value("false"),
                 _ => return None,
@@ -615,7 +615,7 @@ impl<'a> AnyValueBufferTrusted<'a> {
                         s
                     })
                     .collect::<Vec<_>>();
-                StructChunked::new("", &v).unwrap().into_series()
+                StructChunked::from_series("", &v).unwrap().into_series()
             },
             Null(b) => {
                 let mut new = NullChunkedBuilder::new(b.field.name(), 0);

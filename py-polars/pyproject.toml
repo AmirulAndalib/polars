@@ -75,6 +75,9 @@ plot = ["hvplot >= 0.9.1", "polars[pandas]"]
 style = ["great-tables >= 0.8.0"]
 timezone = ["backports.zoneinfo; python_version < '3.9'", "tzdata; platform_system == 'Windows'"]
 
+# GPU Engine
+gpu = ["cudf-polars-cu12"]
+
 # All
 all = [
   "polars[async,cloudpickle,database,deltalake,excel,fsspec,graph,iceberg,numpy,pandas,plot,pyarrow,pydantic,style,timezone]",
@@ -250,6 +253,9 @@ filterwarnings = [
   # TODO: Excel tests lead to unclosed file warnings
   # https://github.com/pola-rs/polars/issues/14466
   "ignore:unclosed file.*:ResourceWarning",
+  # Ignore invalid warnings when running earlier versions of SQLAlchemy (we
+  # know they are invalid because our standard tests run the latest version)
+  "ignore:Deprecated API features detected.*:DeprecationWarning",
 ]
 xfail_strict = true
 

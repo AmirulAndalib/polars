@@ -1,4 +1,4 @@
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use arrow::datatypes::ArrowSchemaRef;
@@ -12,7 +12,7 @@ use super::async_impl::FetchRowGroupsFromObjectStore;
 #[cfg(feature = "cloud")]
 use super::async_impl::ParquetObjectStore;
 pub use super::read_impl::BatchedParquetReader;
-use super::read_impl::{read_parquet, FetchRowGroupsFromMmapReader};
+use super::read_impl::{compute_row_group_range, read_parquet, FetchRowGroupsFromMmapReader};
 #[cfg(feature = "cloud")]
 use super::utils::materialize_empty_df;
 #[cfg(feature = "cloud")]
@@ -28,7 +28,7 @@ use crate::RowIndex;
 pub struct ParquetReader<R: Read + Seek> {
     reader: R,
     rechunk: bool,
-    n_rows: Option<usize>,
+    slice: (usize, usize),
     columns: Option<Vec<String>>,
     projection: Option<Vec<usize>>,
     parallel: ParallelStrategy,
@@ -38,6 +38,7 @@ pub struct ParquetReader<R: Read + Seek> {
     metadata: Option<FileMetaDataRef>,
     predicate: Option<Arc<dyn PhysicalIoExpr>>,
     hive_partition_columns: Option<Vec<Series>>,
+    include_file_path: Option<(Arc<str>, Arc<str>)>,
     use_statistics: bool,
 }
 
@@ -55,9 +56,8 @@ impl<R: MmapBytesReader> ParquetReader<R> {
         self
     }
 
-    /// Stop reading at `num_rows` rows.
-    pub fn with_n_rows(mut self, num_rows: Option<usize>) -> Self {
-        self.n_rows = num_rows;
+    pub fn with_slice(mut self, slice: Option<(usize, usize)>) -> Self {
+        self.slice = slice.unwrap_or((0, usize::MAX));
         self
     }
 
@@ -132,6 +132,14 @@ impl<R: MmapBytesReader> ParquetReader<R> {
         self
     }
 
+    pub fn with_include_file_path(
+        mut self,
+        include_file_path: Option<(Arc<str>, Arc<str>)>,
+    ) -> Self {
+        self.include_file_path = include_file_path;
+        self
+    }
+
     pub fn get_metadata(&mut self) -> PolarsResult<&FileMetaDataRef> {
         if self.metadata.is_none() {
             self.metadata = Some(Arc::new(read::read_metadata(&mut self.reader)?));
@@ -150,18 +158,21 @@ impl<R: MmapBytesReader + 'static> ParquetReader<R> {
         let metadata = self.get_metadata()?.clone();
         let schema = self.schema()?;
 
+        // XXX: Can a parquet file starts at an offset?
+        self.reader.seek(SeekFrom::Start(0))?;
         let row_group_fetcher = FetchRowGroupsFromMmapReader::new(Box::new(self.reader))?.into();
         BatchedParquetReader::new(
             row_group_fetcher,
             metadata,
             schema,
-            self.n_rows.unwrap_or(usize::MAX),
+            self.slice,
             self.projection,
             self.predicate.clone(),
             self.row_index,
             chunk_size,
             self.use_statistics,
             self.hive_partition_columns,
+            self.include_file_path,
             self.parallel,
         )
     }
@@ -173,7 +184,7 @@ impl<R: MmapBytesReader> SerReader<R> for ParquetReader<R> {
         ParquetReader {
             reader,
             rechunk: false,
-            n_rows: None,
+            slice: (0, usize::MAX),
             columns: None,
             projection: None,
             parallel: Default::default(),
@@ -184,6 +195,7 @@ impl<R: MmapBytesReader> SerReader<R> for ParquetReader<R> {
             schema: None,
             use_statistics: true,
             hive_partition_columns: None,
+            include_file_path: None,
         }
     }
 
@@ -195,14 +207,15 @@ impl<R: MmapBytesReader> SerReader<R> for ParquetReader<R> {
     fn finish(mut self) -> PolarsResult<DataFrame> {
         let schema = self.schema()?;
         let metadata = self.get_metadata()?.clone();
+        let n_rows = metadata.num_rows;
 
         if let Some(cols) = &self.columns {
             self.projection = Some(columns_to_projection(cols, schema.as_ref())?);
         }
 
-        read_parquet(
+        let mut df = read_parquet(
             self.reader,
-            self.n_rows.unwrap_or(usize::MAX),
+            self.slice,
             self.projection.as_deref(),
             &schema,
             Some(metadata),
@@ -211,13 +224,26 @@ impl<R: MmapBytesReader> SerReader<R> for ParquetReader<R> {
             self.row_index,
             self.use_statistics,
             self.hive_partition_columns.as_deref(),
-        )
-        .map(|mut df| {
-            if self.rechunk {
-                df.as_single_chunk_par();
-            }
-            df
-        })
+        )?;
+
+        if self.rechunk {
+            df.as_single_chunk_par();
+        };
+
+        if let Some((col, value)) = &self.include_file_path {
+            unsafe {
+                df.with_column_unchecked(
+                    StringChunked::full(
+                        col,
+                        value,
+                        if df.width() > 0 { df.height() } else { n_rows },
+                    )
+                    .into_series(),
+                )
+            };
+        }
+
+        Ok(df)
     }
 }
 
@@ -226,13 +252,14 @@ impl<R: MmapBytesReader> SerReader<R> for ParquetReader<R> {
 #[cfg(feature = "cloud")]
 pub struct ParquetAsyncReader {
     reader: ParquetObjectStore,
-    n_rows: Option<usize>,
+    slice: (usize, usize),
     rechunk: bool,
     projection: Option<Vec<usize>>,
     predicate: Option<Arc<dyn PhysicalIoExpr>>,
     row_index: Option<RowIndex>,
     use_statistics: bool,
     hive_partition_columns: Option<Vec<Series>>,
+    include_file_path: Option<(Arc<str>, Arc<str>)>,
     schema: Option<ArrowSchemaRef>,
     parallel: ParallelStrategy,
 }
@@ -247,12 +274,13 @@ impl ParquetAsyncReader {
         Ok(ParquetAsyncReader {
             reader: ParquetObjectStore::from_uri(uri, cloud_options, metadata).await?,
             rechunk: false,
-            n_rows: None,
+            slice: (0, usize::MAX),
             projection: None,
             row_index: None,
             predicate: None,
             use_statistics: true,
             hive_partition_columns: None,
+            include_file_path: None,
             schema: None,
             parallel: Default::default(),
         })
@@ -293,8 +321,10 @@ impl ParquetAsyncReader {
         self.reader.num_rows().await
     }
 
-    pub fn with_n_rows(mut self, n_rows: Option<usize>) -> Self {
-        self.n_rows = n_rows;
+    /// Only positive offsets are supported for simplicity - the caller should
+    /// translate negative offsets into the positive equivalent.
+    pub fn with_slice(mut self, slice: Option<(usize, usize)>) -> Self {
+        self.slice = slice.unwrap_or((0, usize::MAX));
         self
     }
 
@@ -330,6 +360,14 @@ impl ParquetAsyncReader {
         self
     }
 
+    pub fn with_include_file_path(
+        mut self,
+        include_file_path: Option<(Arc<str>, Arc<str>)>,
+    ) -> Self {
+        self.include_file_path = include_file_path;
+        self
+    }
+
     pub fn read_parallel(mut self, parallel: ParallelStrategy) -> Self {
         self.parallel = parallel;
         self
@@ -347,21 +385,27 @@ impl ParquetAsyncReader {
             schema.clone(),
             self.projection.as_deref(),
             self.predicate.clone(),
+            compute_row_group_range(
+                0,
+                metadata.row_groups.len(),
+                self.slice,
+                &metadata.row_groups,
+            ),
             &metadata.row_groups,
-            self.n_rows.unwrap_or(usize::MAX),
         )?
         .into();
         BatchedParquetReader::new(
             row_group_fetcher,
             metadata,
             schema,
-            self.n_rows.unwrap_or(usize::MAX),
+            self.slice,
             self.projection,
             self.predicate.clone(),
             self.row_index,
             chunk_size,
             self.use_statistics,
             self.hive_partition_columns,
+            self.include_file_path,
             self.parallel,
         )
     }

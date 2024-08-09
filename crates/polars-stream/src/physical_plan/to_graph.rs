@@ -3,17 +3,45 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use polars_error::PolarsResult;
 use polars_expr::planner::{create_physical_expr, get_expr_depth_limit, ExpressionConversionState};
+use polars_expr::reduce::into_reduction;
 use polars_expr::state::ExecutionState;
 use polars_mem_engine::create_physical_plan;
-use polars_plan::plans::{AExpr, Context, IR};
-use polars_utils::arena::Arena;
+use polars_plan::plans::expr_ir::ExprIR;
+use polars_plan::plans::{AExpr, ArenaExprIter, Context, IR};
+use polars_plan::prelude::FunctionFlags;
+use polars_utils::arena::{Arena, Node};
 use recursive::recursive;
 use slotmap::{SecondaryMap, SlotMap};
 
 use super::{PhysNode, PhysNodeKey};
+use crate::expression::StreamExpr;
 use crate::graph::{Graph, GraphNodeKey};
 use crate::nodes;
 use crate::utils::late_materialized_df::LateMaterializedDataFrame;
+
+fn has_potential_recurring_entrance(node: Node, arena: &Arena<AExpr>) -> bool {
+    arena.iter(node).any(|(_n, ae)| match ae {
+        AExpr::Function { options, .. } | AExpr::AnonymousFunction { options, .. } => {
+            options.flags.contains(FunctionFlags::OPTIONAL_RE_ENTRANT)
+        },
+        _ => false,
+    })
+}
+
+fn create_stream_expr(
+    expr_ir: &ExprIR,
+    ctx: &mut GraphConversionContext<'_>,
+) -> PolarsResult<StreamExpr> {
+    let reentrant = has_potential_recurring_entrance(expr_ir.node(), ctx.expr_arena);
+    let phys = create_physical_expr(
+        expr_ir,
+        Context::Default,
+        ctx.expr_arena,
+        None,
+        &mut ctx.expr_conversion_state,
+    )?;
+    Ok(StreamExpr::new(phys, reentrant))
+}
 
 struct GraphConversionContext<'a> {
     phys_sm: &'a SlotMap<PhysNodeKey, PhysNode>,
@@ -73,13 +101,7 @@ fn to_graph_rec<'a>(
         },
 
         Filter { predicate, input } => {
-            let phys_predicate_expr = create_physical_expr(
-                predicate,
-                Context::Default,
-                ctx.expr_arena,
-                None,
-                &mut ctx.expr_conversion_state,
-            )?;
+            let phys_predicate_expr = create_stream_expr(predicate, ctx)?;
             let input_key = to_graph_rec(*input, ctx)?;
             ctx.graph.add_node(
                 nodes::filter::FilterNode::new(phys_predicate_expr),
@@ -95,15 +117,7 @@ fn to_graph_rec<'a>(
         } => {
             let phys_selectors = selectors
                 .iter()
-                .map(|selector| {
-                    create_physical_expr(
-                        selector,
-                        Context::Default,
-                        ctx.expr_arena,
-                        None,
-                        &mut ctx.expr_conversion_state,
-                    )
-                })
+                .map(|selector| create_stream_expr(selector, ctx))
                 .collect::<PolarsResult<_>>()?;
             let input_key = to_graph_rec(*input, ctx)?;
             ctx.graph.add_node(
@@ -115,11 +129,45 @@ fn to_graph_rec<'a>(
                 [input_key],
             )
         },
+        Reduce {
+            input,
+            exprs,
+            input_schema,
+            output_schema,
+        } => {
+            let input_key = to_graph_rec(*input, ctx)?;
 
-        SimpleProjection { schema, input } => {
+            let mut reductions = Vec::with_capacity(exprs.len());
+            let mut inputs = Vec::with_capacity(reductions.len());
+
+            for e in exprs {
+                let (red, input_node) =
+                    into_reduction(e.node(), ctx.expr_arena, input_schema.as_ref())?
+                        .expect("invariant");
+                reductions.push(red);
+
+                let input_phys =
+                    create_stream_expr(&ExprIR::from_node(input_node, ctx.expr_arena), ctx)?;
+
+                inputs.push(input_phys)
+            }
+
+            ctx.graph.add_node(
+                nodes::reduce::ReduceNode::new(inputs, reductions, output_schema.clone()),
+                [input_key],
+            )
+        },
+        SimpleProjection {
+            input,
+            columns,
+            input_schema,
+        } => {
             let input_key = to_graph_rec(*input, ctx)?;
             ctx.graph.add_node(
-                nodes::simple_projection::SimpleProjectionNode::new(schema.clone()),
+                nodes::simple_projection::SimpleProjectionNode::new(
+                    columns.clone(),
+                    input_schema.clone(),
+                ),
                 [input_key],
             )
         },
@@ -193,6 +241,21 @@ fn to_graph_rec<'a>(
                 .collect::<Result<Vec<_>, _>>()?;
             ctx.graph
                 .add_node(nodes::ordered_union::OrderedUnionNode::new(), input_keys)
+        },
+
+        Zip {
+            inputs,
+            input_schemas,
+            null_extend,
+        } => {
+            let input_keys = inputs
+                .iter()
+                .map(|i| to_graph_rec(*i, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            ctx.graph.add_node(
+                nodes::zip::ZipNode::new(*null_extend, input_schemas.clone()),
+                input_keys,
+            )
         },
     };
 

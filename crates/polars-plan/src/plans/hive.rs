@@ -65,7 +65,7 @@ pub fn hive_partitions_from_paths(
     schema: Option<SchemaRef>,
     reader_schema: &Schema,
     try_parse_dates: bool,
-) -> PolarsResult<Option<Arc<[HivePartitions]>>> {
+) -> PolarsResult<Option<Arc<Vec<HivePartitions>>>> {
     let Some(path) = paths.first() else {
         return Ok(None);
     };
@@ -230,7 +230,7 @@ pub fn hive_partitions_from_paths(
 /// Determine the path separator for identifying Hive partitions.
 #[cfg(target_os = "windows")]
 fn separator(url: &Path) -> char {
-    if polars_io::utils::is_cloud_url(url) {
+    if polars_io::path_utils::is_cloud_url(url) {
         '/'
     } else {
         '\\'

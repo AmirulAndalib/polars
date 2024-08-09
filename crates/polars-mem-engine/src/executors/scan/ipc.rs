@@ -4,19 +4,19 @@ use hive::HivePartitions;
 use polars_core::config;
 use polars_core::utils::accumulate_dataframes_vertical;
 use polars_io::cloud::CloudOptions;
+use polars_io::path_utils::is_cloud_url;
 use polars_io::predicates::apply_predicate;
-use polars_io::utils::is_cloud_url;
 use rayon::prelude::*;
 
 use super::*;
 
 pub struct IpcExec {
-    pub(crate) paths: Arc<[PathBuf]>,
+    pub(crate) paths: Arc<Vec<PathBuf>>,
     pub(crate) file_info: FileInfo,
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
     pub(crate) options: IpcScanOptions,
     pub(crate) file_options: FileScanOptions,
-    pub(crate) hive_parts: Option<Arc<[HivePartitions]>>,
+    pub(crate) hive_parts: Option<Arc<Vec<HivePartitions>>>,
     pub(crate) cloud_options: Option<CloudOptions>,
 }
 
@@ -57,7 +57,10 @@ impl IpcExec {
         if config::verbose() {
             eprintln!("executing ipc read sync with row_index = {:?}, n_rows = {:?}, predicate = {:?} for paths {:?}",
                 self.file_options.row_index.as_ref(),
-                self.file_options.n_rows.as_ref(),
+                self.file_options.slice.map(|x| {
+                    assert_eq!(x.0, 0);
+                    x.1
+                }).as_ref(),
                 self.predicate.is_some(),
                 self.paths
             );
@@ -80,6 +83,12 @@ impl IpcExec {
                         .as_ref()
                         .map(|x| x[path_index].materialize_partition_columns()),
                 )
+                .with_include_file_path(self.file_options.include_file_paths.as_ref().map(|x| {
+                    (
+                        x.clone(),
+                        Arc::from(self.paths[path_index].to_str().unwrap().to_string()),
+                    )
+                }))
                 .memory_mapped(
                     self.options
                         .memory_map
@@ -88,7 +97,10 @@ impl IpcExec {
                 .finish()
         };
 
-        let mut dfs = if let Some(mut n_rows) = self.file_options.n_rows {
+        let mut dfs = if let Some(mut n_rows) = self.file_options.slice.map(|x| {
+            assert_eq!(x.0, 0);
+            x.1
+        }) {
             let mut out = Vec::with_capacity(self.paths.len());
 
             for i in 0..self.paths.len() {

@@ -9,11 +9,10 @@ use super::cache::{get_env_file_cache_ttl, FILE_CACHE};
 use super::entry::FileCacheEntry;
 use super::file_fetcher::{CloudFileFetcher, LocalFileFetcher};
 use crate::cloud::{
-    build_object_store, object_path_from_string, CloudLocation, CloudOptions, PolarsObjectStore,
+    build_object_store, object_path_from_str, CloudLocation, CloudOptions, PolarsObjectStore,
 };
+use crate::path_utils::{ensure_directory_init, is_cloud_url, POLARS_TEMP_DIR_BASE_PATH};
 use crate::pl_async;
-use crate::prelude::{is_cloud_url, POLARS_TEMP_DIR_BASE_PATH};
-use crate::utils::ensure_directory_init;
 
 pub static FILE_CACHE_PREFIX: Lazy<Box<Path>> = Lazy::new(|| {
     let path = POLARS_TEMP_DIR_BASE_PATH
@@ -52,12 +51,10 @@ pub(super) fn update_last_accessed(file: &std::fs::File) {
     }
 }
 
-pub fn init_entries_from_uri_list<A: AsRef<[Arc<str>]>>(
-    uri_list: A,
+pub fn init_entries_from_uri_list(
+    uri_list: &[Arc<str>],
     cloud_options: Option<&CloudOptions>,
 ) -> PolarsResult<Vec<Arc<FileCacheEntry>>> {
-    let uri_list = uri_list.as_ref();
-
     if uri_list.is_empty() {
         return Ok(Default::default());
     }
@@ -69,26 +66,36 @@ pub fn init_entries_from_uri_list<A: AsRef<[Arc<str>]>>(
         .unwrap_or_else(get_env_file_cache_ttl);
 
     if is_cloud_url(first_uri) {
-        let (_, object_store) = pl_async::get_runtime()
-            .block_on_potential_spawn(build_object_store(first_uri, cloud_options))?;
-        let object_store = PolarsObjectStore::new(object_store);
+        let object_stores = pl_async::get_runtime().block_on_potential_spawn(async {
+            futures::future::try_join_all(
+                (0..if first_uri.starts_with("http") {
+                    // Object stores for http are tied to the path.
+                    uri_list.len()
+                } else {
+                    1
+                })
+                    .map(|i| async move {
+                        let (_, object_store) =
+                            build_object_store(&uri_list[i], cloud_options, false).await?;
+                        PolarsResult::Ok(PolarsObjectStore::new(object_store))
+                    }),
+            )
+            .await
+        })?;
 
         uri_list
             .iter()
-            .map(|uri| {
+            .enumerate()
+            .map(|(i, uri)| {
                 FILE_CACHE.init_entry(
                     uri.clone(),
                     || {
-                        let CloudLocation {
-                            prefix, expansion, ..
-                        } = CloudLocation::new(uri.as_ref()).unwrap();
+                        let CloudLocation { prefix, .. } =
+                            CloudLocation::new(uri.as_ref(), false).unwrap();
+                        let cloud_path = object_path_from_str(&prefix)?;
 
-                        let cloud_path = {
-                            assert!(expansion.is_none(), "path should not contain wildcards");
-                            object_path_from_string(prefix)?
-                        };
-
-                        let object_store = object_store.clone();
+                        let object_store =
+                            object_stores[std::cmp::min(i, object_stores.len() - 1)].clone();
                         let uri = uri.clone();
 
                         Ok(Arc::new(CloudFileFetcher {

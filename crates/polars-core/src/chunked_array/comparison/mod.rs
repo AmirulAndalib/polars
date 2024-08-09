@@ -3,7 +3,7 @@ mod scalar;
 #[cfg(feature = "dtype-categorical")]
 mod categorical;
 
-use std::ops::Not;
+use std::ops::{BitAnd, Not};
 
 use arrow::array::BooleanArray;
 use arrow::bitmap::MutableBitmap;
@@ -14,6 +14,7 @@ use polars_compute::comparisons::{TotalEqKernel, TotalOrdKernel};
 use crate::prelude::*;
 use crate::series::implementations::null::NullChunked;
 use crate::series::IsSorted;
+use crate::utils::align_chunks_binary;
 
 impl<T> ChunkCompare<&ChunkedArray<T>> for ChunkedArray<T>
 where
@@ -643,77 +644,83 @@ impl ChunkCompare<&ListChunked> for ListChunked {
 }
 
 #[cfg(feature = "dtype-struct")]
+fn struct_helper<F, R>(
+    a: &StructChunked,
+    b: &StructChunked,
+    op: F,
+    reduce: R,
+    value: bool,
+) -> BooleanChunked
+where
+    F: Fn(&Series, &Series) -> BooleanChunked,
+    R: Fn(BooleanChunked, BooleanChunked) -> BooleanChunked,
+{
+    if a.len() != b.len() || a.struct_fields().len() != b.struct_fields().len() {
+        // polars_ensure!(a.len() == 1 || b.len() == 1, ShapeMismatch: "length lhs: {}, length rhs: {}", a.len(), b.len());
+        BooleanChunked::full("", value, a.len())
+    } else {
+        let (a, b) = align_chunks_binary(a, b);
+        let mut out = a
+            .fields_as_series()
+            .iter()
+            .zip(b.fields_as_series().iter())
+            .map(|(l, r)| op(l, r))
+            .reduce(reduce)
+            .unwrap();
+        if a.null_count() > 0 || b.null_count() > 0 {
+            let mut a = a.into_owned();
+            a.zip_outer_validity(&b);
+            unsafe {
+                for (arr, a) in out.downcast_iter_mut().zip(a.downcast_iter()) {
+                    arr.set_validity(a.validity().cloned())
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(feature = "dtype-struct")]
 impl ChunkCompare<&StructChunked> for StructChunked {
     type Item = BooleanChunked;
     fn equal(&self, rhs: &StructChunked) -> BooleanChunked {
-        use std::ops::BitAnd;
-        if self.len() != rhs.len() || self.fields().len() != rhs.fields().len() {
-            BooleanChunked::full("", false, self.len())
-        } else {
-            self.fields()
-                .iter()
-                .zip(rhs.fields().iter())
-                .map(|(l, r)| l.equal(r).unwrap())
-                .reduce(|lhs, rhs| lhs.bitand(rhs))
-                .unwrap()
-        }
+        struct_helper(
+            self,
+            rhs,
+            |l, r| l.equal(r).unwrap(),
+            |a, b| a.bitand(b),
+            false,
+        )
     }
 
     fn equal_missing(&self, rhs: &StructChunked) -> BooleanChunked {
-        use std::ops::BitAnd;
-        if self.len() != rhs.len() || self.fields().len() != rhs.fields().len() {
-            BooleanChunked::full("", false, self.len())
-        } else {
-            self.fields()
-                .iter()
-                .zip(rhs.fields().iter())
-                .map(|(l, r)| l.equal_missing(r).unwrap())
-                .reduce(|lhs, rhs| lhs.bitand(rhs))
-                .unwrap()
-        }
+        struct_helper(
+            self,
+            rhs,
+            |l, r| l.equal_missing(r).unwrap(),
+            |a, b| a.bitand(b),
+            false,
+        )
     }
 
     fn not_equal(&self, rhs: &StructChunked) -> BooleanChunked {
-        if self.len() != rhs.len() || self.fields().len() != rhs.fields().len() {
-            BooleanChunked::full("", true, self.len())
-        } else {
-            self.fields()
-                .iter()
-                .zip(rhs.fields().iter())
-                .map(|(l, r)| l.not_equal(r).unwrap())
-                .reduce(|lhs, rhs| lhs | rhs)
-                .unwrap()
-        }
+        struct_helper(
+            self,
+            rhs,
+            |l, r| l.not_equal(r).unwrap(),
+            |a, b| a | b,
+            true,
+        )
     }
 
     fn not_equal_missing(&self, rhs: &StructChunked) -> BooleanChunked {
-        if self.len() != rhs.len() || self.fields().len() != rhs.fields().len() {
-            BooleanChunked::full("", true, self.len())
-        } else {
-            self.fields()
-                .iter()
-                .zip(rhs.fields().iter())
-                .map(|(l, r)| l.not_equal_missing(r).unwrap())
-                .reduce(|lhs, rhs| lhs | rhs)
-                .unwrap()
-        }
-    }
-
-    // following are not implemented because gt, lt comparison of series don't make sense
-    fn gt(&self, _rhs: &StructChunked) -> BooleanChunked {
-        unimplemented!()
-    }
-
-    fn gt_eq(&self, _rhs: &StructChunked) -> BooleanChunked {
-        unimplemented!()
-    }
-
-    fn lt(&self, _rhs: &StructChunked) -> BooleanChunked {
-        unimplemented!()
-    }
-
-    fn lt_eq(&self, _rhs: &StructChunked) -> BooleanChunked {
-        unimplemented!()
+        struct_helper(
+            self,
+            rhs,
+            |l, r| l.not_equal_missing(r).unwrap(),
+            |a, b| a | b,
+            true,
+        )
     }
 }
 

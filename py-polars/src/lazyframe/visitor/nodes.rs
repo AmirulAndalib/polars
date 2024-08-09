@@ -1,7 +1,9 @@
 use polars_core::prelude::{IdxSize, UniqueKeepStrategy};
 use polars_ops::prelude::JoinType;
 use polars_plan::plans::IR;
-use polars_plan::prelude::{FileCount, FileScan, FileScanOptions, FunctionNode};
+use polars_plan::prelude::{
+    FileCount, FileScan, FileScanOptions, FunctionNode, PythonPredicate, PythonScanSource,
+};
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 
@@ -14,8 +16,6 @@ use crate::PyDataFrame;
 pub struct PythonScan {
     #[pyo3(get)]
     options: PyObject,
-    #[pyo3(get)]
-    predicate: Option<PyExprIR>,
 }
 
 #[pyclass]
@@ -50,7 +50,7 @@ impl PyFileOptions {
     fn n_rows(&self, py: Python<'_>) -> PyResult<PyObject> {
         Ok(self
             .inner
-            .n_rows
+            .slice
             .map_or_else(|| py.None(), |n| n.into_py(py)))
     }
     #[getter]
@@ -257,29 +257,37 @@ pub struct Sink {
 
 pub(crate) fn into_py(py: Python<'_>, plan: &IR) -> PyResult<PyObject> {
     let result = match plan {
-        IR::PythonScan { options, predicate } => PythonScan {
-            options: (
-                options
-                    .scan_fn
-                    .as_ref()
-                    .map_or_else(|| py.None(), |s| s.0.clone()),
-                options
-                    .with_columns
-                    .as_ref()
-                    .map_or_else(|| py.None(), |cols| cols.to_object(py)),
-                options.pyarrow,
-                options
-                    .predicate
-                    .as_ref()
-                    .map_or_else(|| py.None(), |s| s.to_object(py)),
-                options
-                    .n_rows
-                    .map_or_else(|| py.None(), |s| s.to_object(py)),
-            )
-                .to_object(py),
-            predicate: predicate.as_ref().map(|e| e.into()),
-        }
-        .into_py(py),
+        IR::PythonScan { options } => {
+            let python_src = match options.python_source {
+                PythonScanSource::Pyarrow => "pyarrow",
+                PythonScanSource::Cuda => "cuda",
+                PythonScanSource::IOPlugin => "io_plugin",
+            };
+
+            PythonScan {
+                options: (
+                    options
+                        .scan_fn
+                        .as_ref()
+                        .map_or_else(|| py.None(), |s| s.0.clone()),
+                    options
+                        .with_columns
+                        .as_ref()
+                        .map_or_else(|| py.None(), |cols| cols.to_object(py)),
+                    python_src,
+                    match &options.predicate {
+                        PythonPredicate::None => py.None(),
+                        PythonPredicate::PyArrow(s) => ("pyarrow", s).to_object(py),
+                        PythonPredicate::Polars(e) => ("polars", e.node().0).to_object(py),
+                    },
+                    options
+                        .n_rows
+                        .map_or_else(|| py.None(), |s| s.to_object(py)),
+                )
+                    .to_object(py),
+            }
+            .into_py(py)
+        },
         IR::Slice { input, offset, len } => Slice {
             input: input.0,
             offset: *offset,
@@ -316,6 +324,7 @@ pub(crate) fn into_py(py: Python<'_>, plan: &IR) -> PyResult<PyObject> {
                 inner: file_options.clone(),
             },
             scan_type: match scan_type {
+                #[cfg(feature = "csv")]
                 FileScan::Csv {
                     options,
                     cloud_options,
@@ -328,6 +337,7 @@ pub(crate) fn into_py(py: Python<'_>, plan: &IR) -> PyResult<PyObject> {
                         .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
                     ("csv", options, cloud_options).into_py(py)
                 },
+                #[cfg(feature = "parquet")]
                 FileScan::Parquet {
                     options,
                     cloud_options,
@@ -339,8 +349,11 @@ pub(crate) fn into_py(py: Python<'_>, plan: &IR) -> PyResult<PyObject> {
                         .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
                     ("parquet", options, cloud_options).into_py(py)
                 },
+                #[cfg(feature = "ipc")]
                 FileScan::Ipc { .. } => return Err(PyNotImplementedError::new_err("ipc scan")),
-                FileScan::NDJson { options } => {
+                #[cfg(feature = "json")]
+                FileScan::NDJson { options, .. } => {
+                    // TODO: Also pass cloud_options
                     let options = serde_json::to_string(options)
                         .map_err(|err| PyValueError::new_err(format!("{err:?}")))?;
                     ("ndjson", options).into_py(py)
@@ -451,6 +464,7 @@ pub(crate) fn into_py(py: Python<'_>, plan: &IR) -> PyResult<PyObject> {
                     JoinType::Right => "right",
                     JoinType::Inner => "inner",
                     JoinType::Full => "full",
+                    #[cfg(feature = "asof_join")]
                     JoinType::AsOf(_) => return Err(PyNotImplementedError::new_err("asof join")),
                     JoinType::Cross => "cross",
                     JoinType::Semi => "leftsemi",
@@ -533,6 +547,7 @@ pub(crate) fn into_py(py: Python<'_>, plan: &IR) -> PyResult<PyObject> {
                 )
                     .to_object(py),
                 FunctionNode::Rechunk => ("rechunk",).to_object(py),
+                #[cfg(feature = "merge_sorted")]
                 FunctionNode::MergeSorted { column } => {
                     ("merge_sorted", column.to_string()).to_object(py)
                 },

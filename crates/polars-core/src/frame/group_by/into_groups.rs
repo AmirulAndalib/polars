@@ -20,7 +20,7 @@ pub trait IntoGroupsProxy {
 
 fn group_multithreaded<T: PolarsDataType>(ca: &ChunkedArray<T>) -> bool {
     // TODO! change to something sensible
-    ca.len() > 1000
+    ca.len() > 1000 && POOL.current_num_threads() > 1
 }
 
 fn num_groups_proxy<T>(ca: &ChunkedArray<T>, multithreaded: bool, sorted: bool) -> GroupsProxy
@@ -46,7 +46,7 @@ where
                 .collect::<Vec<_>>();
             group_by_threaded_iter(&keys, n_partitions, sorted)
         }
-    } else if !ca.has_validity() {
+    } else if !ca.has_nulls() {
         group_by(ca.into_no_null_iter(), sorted)
     } else {
         group_by(ca.iter(), sorted)
@@ -238,7 +238,9 @@ where
     }
 }
 impl IntoGroupsProxy for BooleanChunked {
-    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
+    fn group_tuples(&self, mut multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
+        multithreaded &= POOL.current_num_threads() > 1;
+
         #[cfg(feature = "performant")]
         {
             let ca = self
@@ -267,7 +269,12 @@ impl IntoGroupsProxy for StringChunked {
 
 impl IntoGroupsProxy for BinaryChunked {
     #[allow(clippy::needless_lifetimes)]
-    fn group_tuples<'a>(&'a self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
+    fn group_tuples<'a>(
+        &'a self,
+        mut multithreaded: bool,
+        sorted: bool,
+    ) -> PolarsResult<GroupsProxy> {
+        multithreaded &= POOL.current_num_threads() > 1;
         let bh = self.to_bytes_hashes(multithreaded, Default::default());
 
         let out = if multithreaded {
@@ -284,7 +291,12 @@ impl IntoGroupsProxy for BinaryChunked {
 
 impl IntoGroupsProxy for BinaryOffsetChunked {
     #[allow(clippy::needless_lifetimes)]
-    fn group_tuples<'a>(&'a self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
+    fn group_tuples<'a>(
+        &'a self,
+        mut multithreaded: bool,
+        sorted: bool,
+    ) -> PolarsResult<GroupsProxy> {
+        multithreaded &= POOL.current_num_threads() > 1;
         let bh = self.to_bytes_hashes(multithreaded, Default::default());
 
         let out = if multithreaded {
@@ -302,7 +314,12 @@ impl IntoGroupsProxy for BinaryOffsetChunked {
 impl IntoGroupsProxy for ListChunked {
     #[allow(clippy::needless_lifetimes)]
     #[allow(unused_variables)]
-    fn group_tuples<'a>(&'a self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
+    fn group_tuples<'a>(
+        &'a self,
+        mut multithreaded: bool,
+        sorted: bool,
+    ) -> PolarsResult<GroupsProxy> {
+        multithreaded &= POOL.current_num_threads() > 1;
         let by = &[self.clone().into_series()];
         let ca = if multithreaded {
             encode_rows_vertical_par_unordered(by).unwrap()

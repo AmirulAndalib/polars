@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use polars_error::PolarsResult;
+use polars_expr::reduce::can_convert_into_reduction;
 use polars_plan::plans::{AExpr, Context, IR};
 use polars_plan::prelude::SinkType;
 use polars_utils::arena::{Arena, Node};
@@ -16,15 +17,21 @@ fn is_streamable(node: Node, arena: &Arena<AExpr>) -> bool {
 pub fn lower_ir(
     node: Node,
     ir_arena: &mut Arena<IR>,
-    expr_arena: &mut Arena<AExpr>,
+    expr_arena: &Arena<AExpr>,
     phys_sm: &mut SlotMap<PhysNodeKey, PhysNode>,
 ) -> PolarsResult<PhysNodeKey> {
     let ir_node = ir_arena.get(node);
     match ir_node {
         IR::SimpleProjection { input, columns } => {
-            let schema = columns.clone();
+            let input_ir_node = ir_arena.get(*input);
+            let input_schema = input_ir_node.schema(ir_arena).into_owned();
+            let columns = columns.iter_names().map(|s| s.to_string()).collect();
             let input = lower_ir(*input, ir_arena, expr_arena, phys_sm)?;
-            Ok(phys_sm.insert(PhysNode::SimpleProjection { input, schema }))
+            Ok(phys_sm.insert(PhysNode::SimpleProjection {
+                input,
+                columns,
+                input_schema,
+            }))
         },
 
         // TODO: split partially streamable selections to avoid fallback as much as possible.
@@ -42,6 +49,29 @@ pub fn lower_ir(
                 selectors,
                 output_schema,
                 extend_original: false,
+            }))
+        },
+        // TODO: split reductions and streamable selections. E.g. sum(a) + sum(b) should be split
+        // into Select(a + b) -> Reduce(sum(a), sum(b)
+        IR::Select {
+            input,
+            expr,
+            schema: output_schema,
+            ..
+        } if expr
+            .iter()
+            .all(|e| can_convert_into_reduction(e.node(), expr_arena)) =>
+        {
+            let exprs = expr.clone();
+            let input_ir_node = ir_arena.get(*input);
+            let input_schema = input_ir_node.schema(ir_arena).into_owned();
+            let output_schema = output_schema.clone();
+            let input_node = lower_ir(*input, ir_arena, expr_arena, phys_sm)?;
+            Ok(phys_sm.insert(PhysNode::Reduce {
+                input: input_node,
+                exprs,
+                input_schema,
+                output_schema,
             }))
         },
 
@@ -88,6 +118,7 @@ pub fn lower_ir(
             df,
             output_schema,
             filter,
+            schema: input_schema,
             ..
         } => {
             if let Some(filter) = filter {
@@ -101,7 +132,8 @@ pub fn lower_ir(
             if let Some(schema) = output_schema {
                 phys_node = phys_sm.insert(PhysNode::SimpleProjection {
                     input: phys_node,
-                    schema: schema.clone(),
+                    input_schema: input_schema.clone(),
+                    columns: schema.iter_names().map(|s| s.to_string()).collect(),
                 })
             }
 
@@ -173,6 +205,31 @@ pub fn lower_ir(
                 .map(|input| lower_ir(input, ir_arena, expr_arena, phys_sm))
                 .collect::<Result<_, _>>()?;
             Ok(phys_sm.insert(PhysNode::OrderedUnion { inputs }))
+        },
+
+        IR::HConcat {
+            inputs,
+            schema: _,
+            options: _,
+        } => {
+            let input_schemas = inputs
+                .iter()
+                .map(|input| {
+                    let input_ir_node = ir_arena.get(*input);
+                    input_ir_node.schema(ir_arena).into_owned()
+                })
+                .collect();
+
+            let inputs = inputs
+                .clone() // Needed to borrow ir_arena mutably.
+                .into_iter()
+                .map(|input| lower_ir(input, ir_arena, expr_arena, phys_sm))
+                .collect::<Result<_, _>>()?;
+            Ok(phys_sm.insert(PhysNode::Zip {
+                inputs,
+                input_schemas,
+                null_extend: true,
+            }))
         },
 
         _ => todo!(),

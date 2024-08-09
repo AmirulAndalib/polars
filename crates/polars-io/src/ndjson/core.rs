@@ -137,7 +137,7 @@ where
 impl<'a> JsonLineReader<'a, File> {
     /// This is the recommended way to create a json reader as this allows for fastest parsing.
     pub fn from_path<P: Into<PathBuf>>(path: P) -> PolarsResult<Self> {
-        let path = resolve_homedir(&path.into());
+        let path = crate::resolve_homedir(&path.into());
         let f = polars_utils::open_file(&path)?;
         Ok(Self::new(f).with_path(Some(path)))
     }
@@ -316,13 +316,13 @@ impl<'a> CoreJsonReader<'a> {
                     )?;
 
                     let prepredicate_height = local_df.height() as IdxSize;
+                    if let Some(projection) = &self.projection {
+                        local_df = local_df.select(projection.as_ref())?;
+                    }
+
                     if let Some(row_index) = row_index {
                         local_df = local_df
                             .with_row_index(row_index.name.as_ref(), Some(row_index.offset))?;
-                    }
-
-                    if let Some(projection) = &self.projection {
-                        local_df = local_df.select(projection.as_ref())?;
                     }
 
                     if let Some(predicate) = &self.predicate {

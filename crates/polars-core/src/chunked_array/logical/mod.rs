@@ -16,8 +16,6 @@ mod duration;
 pub use duration::*;
 #[cfg(feature = "dtype-categorical")]
 pub mod categorical;
-#[cfg(feature = "dtype-struct")]
-mod struct_;
 #[cfg(feature = "dtype-time")]
 mod time;
 
@@ -26,8 +24,6 @@ use std::ops::{Deref, DerefMut};
 
 #[cfg(feature = "dtype-categorical")]
 pub use categorical::*;
-#[cfg(feature = "dtype-struct")]
-pub use struct_::*;
 #[cfg(feature = "dtype-time")]
 pub use time::*;
 
@@ -96,6 +92,9 @@ impl<K: PolarsDataType, T: PolarsDataType> Logical<K, T>
 where
     Self: LogicalType,
 {
+    pub fn physical(&self) -> &ChunkedArray<T> {
+        &self.0
+    }
     pub fn field(&self) -> Field {
         let name = self.0.ref_field().name();
         Field::new(name, LogicalType::dtype(self).clone())

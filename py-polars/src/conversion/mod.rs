@@ -17,6 +17,7 @@ use polars_core::utils::arrow::array::Array;
 use polars_core::utils::arrow::types::NativeType;
 use polars_core::utils::materialize_dyn_int;
 use polars_lazy::prelude::*;
+#[cfg(feature = "parquet")]
 use polars_parquet::write::StatisticsOptions;
 use polars_utils::total_ord::{TotalEq, TotalHash};
 use pyo3::basic::CompareOp;
@@ -64,11 +65,6 @@ pub(crate) fn reinterpret_vec<T: Transparent>(input: Vec<T>) -> Vec<T::Target> {
     unsafe { Vec::from_raw_parts(ptr, len, cap) }
 }
 
-pub(crate) fn slice_to_wrapped<T>(slice: &[T]) -> &[Wrap<T>] {
-    // SAFETY: Wrap is transparent.
-    unsafe { std::mem::transmute(slice) }
-}
-
 pub(crate) fn vec_extract_wrapped<T>(buf: Vec<Wrap<T>>) -> Vec<T> {
     reinterpret_vec(buf)
 }
@@ -102,8 +98,8 @@ pub(crate) fn get_lf(obj: &Bound<'_, PyAny>) -> PyResult<LazyFrame> {
 }
 
 pub(crate) fn get_series(obj: &Bound<'_, PyAny>) -> PyResult<Series> {
-    let pydf = obj.getattr(intern!(obj.py(), "_s"))?;
-    Ok(pydf.extract::<PySeries>()?.series)
+    let s = obj.getattr(intern!(obj.py(), "_s"))?;
+    Ok(s.extract::<PySeries>()?.series)
 }
 
 pub(crate) fn to_series(py: Python, s: PySeries) -> PyObject {
@@ -466,6 +462,7 @@ impl ToPyObject for Wrap<TimeUnit> {
     }
 }
 
+#[cfg(feature = "parquet")]
 impl<'s> FromPyObject<'s> for Wrap<StatisticsOptions> {
     fn extract_bound(ob: &Bound<'s, PyAny>) -> PyResult<Self> {
         let mut statistics = StatisticsOptions::empty();
@@ -874,10 +871,11 @@ impl<'py> FromPyObject<'py> for Wrap<ParallelStrategy> {
             "auto" => ParallelStrategy::Auto,
             "columns" => ParallelStrategy::Columns,
             "row_groups" => ParallelStrategy::RowGroups,
+            "prefiltered" => ParallelStrategy::Prefiltered,
             "none" => ParallelStrategy::None,
             v => {
                 return Err(PyValueError::new_err(format!(
-                "`parallel` must be one of {{'auto', 'columns', 'row_groups', 'none'}}, got {v}",
+                "`parallel` must be one of {{'auto', 'columns', 'row_groups', 'prefiltered', 'none'}}, got {v}",
             )))
             },
         };

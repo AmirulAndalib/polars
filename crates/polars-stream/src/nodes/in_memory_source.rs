@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::compute_node_prelude::*;
 use crate::async_primitives::wait_group::WaitGroup;
-use crate::morsel::{get_ideal_morsel_size, MorselSeq};
+use crate::morsel::{get_ideal_morsel_size, MorselSeq, SourceToken};
 
 pub struct InMemorySourceNode {
     source: Option<Arc<DataFrame>>,
@@ -28,9 +28,9 @@ impl ComputeNode for InMemorySourceNode {
 
     fn initialize(&mut self, num_pipelines: usize) {
         let len = self.source.as_ref().unwrap().height();
-        let ideal_block_count = (len / get_ideal_morsel_size()).max(1);
-        let block_count = ideal_block_count.next_multiple_of(num_pipelines);
-        self.morsel_size = len.div_ceil(block_count).max(1);
+        let ideal_morsel_count = (len / get_ideal_morsel_size()).max(1);
+        let morsel_count = ideal_morsel_count.next_multiple_of(num_pipelines);
+        self.morsel_size = len.div_ceil(morsel_count).max(1);
         self.seq = AtomicU64::new(0);
     }
 
@@ -55,36 +55,45 @@ impl ComputeNode for InMemorySourceNode {
     }
 
     fn spawn<'env, 's>(
-        &'env self,
+        &'env mut self,
         scope: &'s TaskScope<'s, 'env>,
-        _pipeline: usize,
-        recv: &mut [Option<Receiver<Morsel>>],
-        send: &mut [Option<Sender<Morsel>>],
+        recv: &mut [Option<RecvPort<'_>>],
+        send: &mut [Option<SendPort<'_>>],
         _state: &'s ExecutionState,
-    ) -> JoinHandle<PolarsResult<()>> {
+        join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
+    ) {
         assert!(recv.is_empty() && send.len() == 1);
-        let mut send = send[0].take().unwrap();
+        let senders = send[0].take().unwrap().parallel();
         let source = self.source.as_ref().unwrap();
 
-        scope.spawn_task(TaskPriority::Low, async move {
-            let wait_group = WaitGroup::default();
-            loop {
-                let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-                let offset = (seq as usize * self.morsel_size) as i64;
-                let df = source.slice(offset, self.morsel_size);
-                if df.is_empty() {
-                    break;
+        // TODO: can this just be serial, using the work distributor?
+        for mut send in senders {
+            let slf = &*self;
+            join_handles.push(scope.spawn_task(TaskPriority::Low, async move {
+                let wait_group = WaitGroup::default();
+                let source_token = SourceToken::new();
+                loop {
+                    let seq = slf.seq.fetch_add(1, Ordering::Relaxed);
+                    let offset = (seq as usize * slf.morsel_size) as i64;
+                    let df = source.slice(offset, slf.morsel_size);
+                    if df.is_empty() {
+                        break;
+                    }
+
+                    let mut morsel = Morsel::new(df, MorselSeq::new(seq), source_token.clone());
+                    morsel.set_consume_token(wait_group.token());
+                    if send.send(morsel).await.is_err() {
+                        break;
+                    }
+
+                    wait_group.wait().await;
+                    if source_token.stop_requested() {
+                        break;
+                    }
                 }
 
-                let mut morsel = Morsel::new(df, MorselSeq::new(seq));
-                morsel.set_consume_token(wait_group.token());
-                if send.send(morsel).await.is_err() {
-                    break;
-                }
-                wait_group.wait().await;
-            }
-
-            Ok(())
-        })
+                Ok(())
+            }));
+        }
     }
 }

@@ -25,23 +25,27 @@ fn can_pushdown_slice_past_projections(exprs: &[ExprIR], arena: &Arena<AExpr>) -
     for expr_ir in exprs.iter() {
         // `select(c = Literal([1, 2, 3])).slice(0, 0)` must block slice pushdown,
         // because `c` projects to a height independent from the input height. We check
-        // this by observing that `c` does not have any columns in its input notes.
+        // this by observing that `c` does not have any columns in its input nodes.
         //
         // TODO: Simply checking that a column node is present does not handle e.g.:
         // `select(c = Literal([1, 2, 3]).is_in(col(a)))`, for functions like `is_in`,
         // `str.contains`, `str.contains_many` etc. - observe a column node is present
         // but the output height is not dependent on it.
-        let mut has_column = false;
-        let mut literals_all_scalar = true;
-        let is_elementwise = arena.iter(expr_ir.node()).all(|(_node, ae)| {
-            has_column |= matches!(ae, AExpr::Column(_));
-            literals_all_scalar &= if let AExpr::Literal(v) = ae {
-                v.projects_as_scalar()
-            } else {
-                true
-            };
-            single_aexpr_is_elementwise(ae)
-        });
+        let is_elementwise = is_streamable(expr_ir.node(), arena, Context::Default);
+        let (has_column, literals_all_scalar) = arena.iter(expr_ir.node()).fold(
+            (false, true),
+            |(has_column, lit_scalar), (_node, ae)| {
+                (
+                    has_column | matches!(ae, AExpr::Column(_)),
+                    lit_scalar
+                        & if let AExpr::Literal(v) = ae {
+                            v.projects_as_scalar()
+                        } else {
+                            true
+                        },
+                )
+            },
+        );
 
         // If there is no column then all literals must be scalar
         if !is_elementwise || !(has_column || literals_all_scalar) {
@@ -149,15 +153,13 @@ impl SlicePushDown {
             #[cfg(feature = "python")]
             (PythonScan {
                 mut options,
-                predicate,
             },
             // TODO! we currently skip slice pushdown if there is a predicate.
             // we can modify the readers to only limit after predicates have been applied
-                Some(state)) if state.offset == 0 && predicate.is_none() => {
+                Some(state)) if state.offset == 0 && matches!(options.predicate, PythonPredicate::None) => {
                 options.n_rows = Some(state.len as usize);
                 let lp = PythonScan {
                     options,
-                    predicate
                 };
                 Ok(lp)
             }
@@ -171,7 +173,7 @@ impl SlicePushDown {
                 predicate,
                 scan_type: FileScan::Csv { options, cloud_options },
             }, Some(state)) if predicate.is_none() && state.offset >= 0 =>  {
-                file_options.n_rows = Some(state.offset as usize + state.len as usize);
+                file_options.slice = Some((0, state.offset as usize + state.len as usize));
 
                 let lp = Scan {
                     paths,
@@ -185,6 +187,30 @@ impl SlicePushDown {
 
                 self.no_pushdown_finish_opt(lp, Some(state), lp_arena)
             },
+            #[cfg(feature = "parquet")]
+            (Scan {
+                paths,
+                file_info,
+                hive_parts,
+                output_schema,
+                mut file_options,
+                predicate,
+                scan_type: scan_type @ FileScan::Parquet { .. },
+            }, Some(state)) if predicate.is_none() =>  {
+                file_options.slice = Some((state.offset, state.len as usize));
+
+                let lp = Scan {
+                    paths,
+                    file_info,
+                    hive_parts,
+                    output_schema,
+                    scan_type,
+                    file_options,
+                    predicate,
+                };
+
+                Ok(lp)
+            },
             // TODO! we currently skip slice pushdown if there is a predicate.
             (Scan {
                 paths,
@@ -195,7 +221,8 @@ impl SlicePushDown {
                 predicate,
                 scan_type
             }, Some(state)) if state.offset == 0 && predicate.is_none() => {
-                options.n_rows = Some(state.len as usize);
+                options.slice = Some((0, state.len as usize));
+
                 let lp = Scan {
                     paths,
                     file_info,

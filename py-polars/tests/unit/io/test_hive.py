@@ -137,7 +137,10 @@ def test_hive_partitioned_predicate_pushdown_skips_correct_number_of_files(
 
 @pytest.mark.xdist_group("streaming")
 @pytest.mark.write_disk()
-def test_hive_partitioned_slice_pushdown(io_files_path: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("streaming", [True, False])
+def test_hive_partitioned_slice_pushdown(
+    io_files_path: Path, tmp_path: Path, streaming: bool
+) -> None:
     df = pl.read_ipc(io_files_path / "*.ipc")
 
     root = tmp_path / "partitioned_data"
@@ -152,21 +155,18 @@ def test_hive_partitioned_slice_pushdown(io_files_path: Path, tmp_path: Path) ->
     )
 
     q = pl.scan_parquet(root / "**/*.parquet", hive_partitioning=True)
+    schema = q.collect_schema()
+    expect_count = pl.select(pl.lit(1, dtype=pl.UInt32).alias(x) for x in schema)
 
-    # tests: 11682
-    for streaming in [True, False]:
-        assert (
-            q.head(1)
-            .collect(streaming=streaming)
-            .select(pl.all_horizontal(pl.all().count() == 1))
-            .item()
-        )
-        assert q.head(0).collect(streaming=streaming).columns == [
-            "calories",
-            "sugars_g",
-            "category",
-            "fats_g",
-        ]
+    assert_frame_equal(
+        q.head(1).collect(streaming=streaming).select(pl.all().len()), expect_count
+    )
+    assert q.head(0).collect(streaming=streaming).columns == [
+        "calories",
+        "sugars_g",
+        "category",
+        "fats_g",
+    ]
 
 
 @pytest.mark.xdist_group("streaming")
@@ -305,7 +305,7 @@ def test_read_parquet_hive_schema_with_pyarrow() -> None:
 )
 def test_hive_partition_directory_scan(
     tmp_path: Path,
-    scan_func: Callable[[Any], pl.LazyFrame],
+    scan_func: Callable[..., pl.LazyFrame],
     write_func: Callable[[pl.DataFrame, Path], None],
     glob: bool,
 ) -> None:
@@ -395,7 +395,9 @@ def test_hive_partition_directory_scan(
         pl.exceptions.InvalidOperationError,
         match="attempted to read from different directory levels with hive partitioning enabled:",
     ):
-        scan([tmp_path / "a=1", tmp_path / "a=22/b=1"], hive_partitioning=True)
+        scan(
+            [tmp_path / "a=1", tmp_path / "a=22/b=1"], hive_partitioning=True
+        ).collect()
 
     if glob:
         out = scan(tmp_path / "**/*.bin", hive_partitioning=True).collect()
@@ -670,7 +672,7 @@ def test_projection_only_hive_parts_gives_correct_number_of_rows(
 @pytest.mark.write_disk()
 def test_hive_write(tmp_path: Path, df: pl.DataFrame) -> None:
     root = tmp_path
-    df.write_parquet_partitioned(root, ["a", "b"])
+    df.write_parquet(root, partition_by=["a", "b"])
 
     lf = pl.scan_parquet(root)
     assert_frame_equal(lf.collect(), df)
@@ -681,7 +683,7 @@ def test_hive_write(tmp_path: Path, df: pl.DataFrame) -> None:
 
 @pytest.mark.slow()
 @pytest.mark.write_disk()
-def test_hive_write_multiple_files(tmp_path: Path, monkeypatch: Any) -> None:
+def test_hive_write_multiple_files(tmp_path: Path) -> None:
     chunk_size = 262_144
     n_rows = 100_000
     df = pl.select(a=pl.repeat(0, n_rows), b=pl.int_range(0, n_rows))
@@ -691,7 +693,7 @@ def test_hive_write_multiple_files(tmp_path: Path, monkeypatch: Any) -> None:
     assert n_files > 1, "increase df size or decrease file size"
 
     root = tmp_path
-    df.write_parquet_partitioned(root, ["a"], chunk_size_bytes=chunk_size)
+    df.write_parquet(root, partition_by="a", partition_chunk_size_bytes=chunk_size)
 
     assert sum(1 for _ in (root / "a=0").iterdir()) == n_files
     assert_frame_equal(pl.scan_parquet(root).collect(), df)
@@ -719,7 +721,7 @@ def test_hive_write_dates(tmp_path: Path) -> None:
     )
 
     root = tmp_path
-    df.write_parquet_partitioned(root, ["date1", "date2"])
+    df.write_parquet(root, partition_by=["date1", "date2"])
 
     lf = pl.scan_parquet(root)
     assert_frame_equal(lf.collect(), df)
@@ -729,3 +731,15 @@ def test_hive_write_dates(tmp_path: Path) -> None:
         lf.collect(),
         df.with_columns(pl.col("date1", "date2").cast(pl.String)),
     )
+
+
+@pytest.mark.write_disk()
+def test_hive_predicate_dates_14712(
+    tmp_path: Path, monkeypatch: Any, capfd: Any
+) -> None:
+    monkeypatch.setenv("POLARS_VERBOSE", "1")
+    pl.DataFrame({"a": [datetime(2024, 1, 1)]}).write_parquet(
+        tmp_path, partition_by="a"
+    )
+    pl.scan_parquet(tmp_path).filter(pl.col("a") != datetime(2024, 1, 1)).collect()
+    assert "hive partitioning: skipped 1 files" in capfd.readouterr().err

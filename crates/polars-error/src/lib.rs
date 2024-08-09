@@ -55,11 +55,11 @@ pub enum PolarsError {
     ComputeError(ErrString),
     #[error("duplicate: {0}")]
     Duplicate(ErrString),
-    #[error("invalid operation: {0}")]
+    #[error("{0}")]
     InvalidOperation(ErrString),
     #[error("{}", match msg {
-     Some(msg) => format!("{}", msg),
-     None => format!("{}", error)
+        Some(msg) => format!("{}", msg),
+        None => format!("{}", error)
     })]
     IO {
         error: Arc<io::Error>,
@@ -327,6 +327,9 @@ on startup."#.trim_start())
     };
     (duplicate = $name:expr) => {
         polars_err!(Duplicate: "column with name '{}' has more than one occurrences", $name)
+    };
+    (col_not_found = $name:expr) => {
+        polars_err!(ColumnNotFound: "{:?} not found", $name)
     };
     (oob = $idx:expr, $len:expr) => {
         polars_err!(OutOfBounds: "index {} is out of bounds for sequence of length {}", $idx, $len)

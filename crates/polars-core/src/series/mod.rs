@@ -192,29 +192,34 @@ impl Series {
         ca.chunks_mut()
     }
 
+    // TODO! this probably can now be removed, now we don't have special case for structs.
     pub fn select_chunk(&self, i: usize) -> Self {
-        match self.dtype() {
-            #[cfg(feature = "dtype-struct")]
-            DataType::Struct(_) => {
-                let mut ca = self.struct_().unwrap().clone();
-                for field in ca.fields_mut().iter_mut() {
-                    *field = field.select_chunk(i)
-                }
-                ca.update_chunks(0);
-                ca.into_series()
-            },
-            _ => {
-                let mut new = self.clear();
-                // Assign mut so we go through arc only once.
-                let mut_new = new._get_inner_mut();
-                let chunks = unsafe { mut_new.chunks_mut() };
-                let chunk = self.chunks()[i].clone();
-                chunks.clear();
-                chunks.push(chunk);
-                mut_new.compute_len();
-                new
-            },
-        }
+        let mut new = self.clear();
+        let flags = self.get_flags();
+
+        let mut new_flags = MetadataFlags::empty();
+        new_flags.set(
+            MetadataFlags::SORTED_ASC,
+            flags.contains(MetadataFlags::SORTED_ASC),
+        );
+        new_flags.set(
+            MetadataFlags::SORTED_DSC,
+            flags.contains(MetadataFlags::SORTED_DSC),
+        );
+        new_flags.set(
+            MetadataFlags::FAST_EXPLODE_LIST,
+            flags.contains(MetadataFlags::FAST_EXPLODE_LIST),
+        );
+
+        // Assign mut so we go through arc only once.
+        let mut_new = new._get_inner_mut();
+        let chunks = unsafe { mut_new.chunks_mut() };
+        let chunk = self.chunks()[i].clone();
+        chunks.clear();
+        chunks.push(chunk);
+        mut_new.compute_len();
+        mut_new._set_flags(new_flags);
+        new
     }
 
     pub fn is_sorted_flag(&self) -> IsSorted {
@@ -612,11 +617,15 @@ impl Series {
             Struct(_) => {
                 let arr = self.struct_().unwrap();
                 let fields: Vec<_> = arr
-                    .fields()
+                    .fields_as_series()
                     .iter()
                     .map(|s| s.to_physical_repr().into_owned())
                     .collect();
-                let ca = StructChunked::new(self.name(), &fields).unwrap();
+                let mut ca = StructChunked::from_series(self.name(), &fields).unwrap();
+
+                if arr.null_count() > 0 {
+                    ca.zip_outer_validity(arr);
+                }
                 Cow::Owned(ca.into_series())
             },
             _ => Cow::Borrowed(self),
@@ -816,41 +825,7 @@ impl Series {
     }
 
     pub fn mean_reduce(&self) -> Scalar {
-        match self.dtype() {
-            DataType::Float32 => {
-                let val = self.mean().map(|m| m as f32);
-                Scalar::new(self.dtype().clone(), val.into())
-            },
-            dt if dt.is_numeric() || matches!(dt, DataType::Boolean) => {
-                let val = self.mean();
-                Scalar::new(DataType::Float64, val.into())
-            },
-            #[cfg(feature = "dtype-date")]
-            DataType::Date => {
-                let val = self.mean().map(|v| (v * MS_IN_DAY as f64) as i64);
-                let av: AnyValue = val.into();
-                Scalar::new(DataType::Datetime(TimeUnit::Milliseconds, None), av)
-            },
-            #[cfg(feature = "dtype-datetime")]
-            dt @ DataType::Datetime(_, _) => {
-                let val = self.mean().map(|v| v as i64);
-                let av: AnyValue = val.into();
-                Scalar::new(dt.clone(), av)
-            },
-            #[cfg(feature = "dtype-duration")]
-            dt @ DataType::Duration(_) => {
-                let val = self.mean().map(|v| v as i64);
-                let av: AnyValue = val.into();
-                Scalar::new(dt.clone(), av)
-            },
-            #[cfg(feature = "dtype-time")]
-            dt @ DataType::Time => {
-                let val = self.mean().map(|v| v as i64);
-                let av: AnyValue = val.into();
-                Scalar::new(dt.clone(), av)
-            },
-            dt => Scalar::new(dt.clone(), AnyValue::Null),
-        }
+        crate::scalar::reduce::mean_reduce(self.mean(), self.dtype().clone())
     }
 
     /// Compute the unique elements, but maintain order. This requires more work
@@ -944,31 +919,31 @@ impl Default for Series {
     }
 }
 
+fn equal_outer_type<T: 'static + PolarsDataType>(dtype: &DataType) -> bool {
+    match (T::get_dtype(), dtype) {
+        (DataType::List(_), DataType::List(_)) => true,
+        #[cfg(feature = "dtype-array")]
+        (DataType::Array(_, _), DataType::Array(_, _)) => true,
+        #[cfg(feature = "dtype-struct")]
+        (DataType::Struct(_), DataType::Struct(_)) => true,
+        (a, b) => &a == b,
+    }
+}
+
 impl<'a, T> AsRef<ChunkedArray<T>> for dyn SeriesTrait + 'a
 where
     T: 'static + PolarsDataType,
 {
     fn as_ref(&self) -> &ChunkedArray<T> {
-        #[cfg(feature = "dtype-array")]
-        let is_array = matches!(T::get_dtype(), DataType::Array(_, _))
-            && matches!(self.dtype(), DataType::Array(_, _));
-        #[cfg(not(feature = "dtype-array"))]
-        let is_array = false;
-
-        if &T::get_dtype() == self.dtype() ||
-            // Needed because we want to get ref of List no matter what the inner type is.
-            (matches!(T::get_dtype(), DataType::List(_)) && matches!(self.dtype(), DataType::List(_)))
-            // Similarly for arrays.
-            || is_array
-        {
-            unsafe { &*(self as *const dyn SeriesTrait as *const ChunkedArray<T>) }
-        } else {
-            panic!(
-                "implementation error, cannot get ref {:?} from {:?}",
-                T::get_dtype(),
-                self.dtype()
-            );
-        }
+        let eq = equal_outer_type::<T>(self.dtype());
+        assert!(
+            eq,
+            "implementation error, cannot get ref {:?} from {:?}",
+            T::get_dtype(),
+            self.dtype()
+        );
+        // SAFETY: we just checked the type.
+        unsafe { &*(self as *const dyn SeriesTrait as *const ChunkedArray<T>) }
     }
 }
 
@@ -977,18 +952,14 @@ where
     T: 'static + PolarsDataType,
 {
     fn as_mut(&mut self) -> &mut ChunkedArray<T> {
-        if &T::get_dtype() == self.dtype() ||
-            // Needed because we want to get ref of List no matter what the inner type is.
-            (matches!(T::get_dtype(), DataType::List(_)) && matches!(self.dtype(), DataType::List(_)))
-        {
-            unsafe { &mut *(self as *mut dyn SeriesTrait as *mut ChunkedArray<T>) }
-        } else {
-            panic!(
-                "implementation error, cannot get ref {:?} from {:?}",
-                T::get_dtype(),
-                self.dtype()
-            )
-        }
+        let eq = equal_outer_type::<T>(self.dtype());
+        assert!(
+            eq,
+            "implementation error, cannot get ref {:?} from {:?}",
+            T::get_dtype(),
+            self.dtype()
+        );
+        unsafe { &mut *(self as *mut dyn SeriesTrait as *mut ChunkedArray<T>) }
     }
 }
 

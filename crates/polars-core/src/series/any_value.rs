@@ -1,5 +1,7 @@
 use std::fmt::Write;
 
+use arrow::bitmap::MutableBitmap;
+
 #[cfg(feature = "dtype-categorical")]
 use crate::chunked_array::cast::CastOptions;
 #[cfg(feature = "object")]
@@ -66,7 +68,7 @@ impl Series {
 
         // TODO: Remove this when Decimal data type equality is implemented.
         #[cfg(feature = "dtype-decimal")]
-        if !strict && dtype.is_decimal() {
+        if dtype.is_decimal() {
             let dtype = DataType::Decimal(None, None);
             return Self::from_any_values_and_dtype(name, values, &dtype, strict);
         }
@@ -486,7 +488,17 @@ fn any_values_to_decimal(
     let mut builder = PrimitiveChunkedBuilder::<Int128Type>::new("", values.len());
     for av in values {
         match av {
-            AnyValue::Decimal(v, s) if *s == scale => builder.append_value(*v),
+            // Allow equal or less scale. We do want to support different scales even in 'strict' mode.
+            AnyValue::Decimal(v, s) if *s <= scale => {
+                if *s == scale {
+                    builder.append_value(*v)
+                } else {
+                    match av.strict_cast(&target_dtype) {
+                        Some(AnyValue::Decimal(i, _)) => builder.append_value(i),
+                        _ => builder.append_null(),
+                    }
+                }
+            },
             AnyValue::Null => builder.append_null(),
             av => {
                 if strict {
@@ -510,9 +522,18 @@ fn any_values_to_list(
     inner_type: &DataType,
     strict: bool,
 ) -> PolarsResult<ListChunked> {
-    let target_dtype = DataType::List(Box::new(inner_type.clone()));
+    let it = match inner_type {
+        // Structs don't support empty fields yet.
+        // We must ensure the data-types match what we do physical
+        #[cfg(feature = "dtype-struct")]
+        DataType::Struct(fields) if fields.is_empty() => {
+            DataType::Struct(vec![Field::new("", DataType::Null)])
+        },
+        _ => inner_type.clone(),
+    };
+    let target_dtype = DataType::List(Box::new(it));
 
-    // This is handled downstream. The builder will choose the first non null type.
+    // This is handled downstream. The builder will choose the first non-null type.
     let mut valid = true;
     #[allow(unused_mut)]
     let mut out: ListChunked = if inner_type == &DataType::Null {
@@ -654,8 +675,10 @@ fn any_values_to_struct(
 
     // The physical series fields of the struct.
     let mut series_fields = Vec::with_capacity(fields.len());
+    let mut has_outer_validity = false;
+    let mut field_avs = Vec::with_capacity(values.len());
     for (i, field) in fields.iter().enumerate() {
-        let mut field_avs = Vec::with_capacity(values.len());
+        field_avs.clear();
 
         for av in values.iter() {
             match av {
@@ -666,29 +689,20 @@ fn any_values_to_struct(
 
                     let mut append_by_search = || {
                         // Search for the name.
-                        let mut pushed = false;
-                        for (av_fld, av_val) in av_fields.iter().zip(av_values) {
-                            if av_fld.name == field.name {
-                                field_avs.push(av_val.clone());
-                                pushed = true;
-                                break;
-                            }
+                        if let Some(i) = av_fields
+                            .iter()
+                            .position(|av_fld| av_fld.name == field.name)
+                        {
+                            field_avs.push(av_values[i].clone());
+                            return;
                         }
-                        if !pushed {
-                            field_avs.push(AnyValue::Null)
-                        }
+                        field_avs.push(AnyValue::Null)
                     };
 
                     // All fields are available in this single value.
                     // We can use the index to get value.
                     if fields.len() == av_fields.len() {
-                        let mut search = false;
-                        for (l, r) in fields.iter().zip(av_fields.iter()) {
-                            if l.name() != r.name() {
-                                search = true;
-                            }
-                        }
-                        if search {
+                        if fields.iter().zip(av_fields.iter()).any(|(l, r)| l != r) {
                             append_by_search()
                         } else {
                             let av_val = av_values.get(i).cloned().unwrap_or(AnyValue::Null);
@@ -701,7 +715,10 @@ fn any_values_to_struct(
                         append_by_search()
                     }
                 },
-                _ => field_avs.push(AnyValue::Null),
+                _ => {
+                    has_outer_validity = true;
+                    field_avs.push(AnyValue::Null)
+                },
             }
         }
         // If the inferred dtype is null, we let auto inference work.
@@ -712,7 +729,19 @@ fn any_values_to_struct(
         };
         series_fields.push(s)
     }
-    StructChunked::new("", &series_fields).map(|ca| ca.into_series())
+
+    let mut out = StructChunked::from_series("", &series_fields)?;
+    if has_outer_validity {
+        let mut validity = MutableBitmap::new();
+        validity.extend_constant(values.len(), true);
+        for (i, v) in values.iter().enumerate() {
+            if matches!(v, AnyValue::Null) {
+                unsafe { validity.set_unchecked(i, false) }
+            }
+        }
+        out.set_outer_validity(Some(validity.freeze()))
+    }
+    Ok(out.into_series())
 }
 
 #[cfg(feature = "object")]

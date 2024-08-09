@@ -230,7 +230,7 @@ def test_explode_array() -> None:
     )
     expected = pl.DataFrame({"a": [1, 2, 2, 3], "b": [1, 1, 2, 2]})
     for ex in ("a", ~cs.integer()):
-        out = df.explode(ex).collect()  # type: ignore[arg-type]
+        out = df.explode(ex).collect()
         assert_frame_equal(out, expected)
 
 
@@ -261,7 +261,7 @@ def test_explode_null_struct() -> None:
 
     assert pl.DataFrame(df).explode("col1").to_dict(as_series=False) == {
         "col1": [
-            {"field1": None, "field2": None, "field3": None},
+            None,
             {"field1": None, "field2": None, "field3": None},
             {"field1": None, "field2": "some", "field3": "value"},
         ]
@@ -438,3 +438,12 @@ def test_undefined_col_15852() -> None:
 
     with pytest.raises(pl.exceptions.ColumnNotFoundError):
         lf.explode("bar").join(lf, on="foo").collect()
+
+
+def test_explode_17648() -> None:
+    df = pl.DataFrame({"a": [[1, 3], [2, 6, 7], [3, 9, 2], [4], [5, 1, 2, 3, 4]]})
+    assert (
+        df.slice(1, 2)
+        .with_columns(pl.int_ranges(pl.col("a").list.len()).alias("count"))
+        .explode("a", "count")
+    ).to_dict(as_series=False) == {"a": [2, 6, 7, 3, 9, 2], "count": [0, 1, 2, 0, 1, 2]}

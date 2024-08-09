@@ -27,6 +27,8 @@ use polars_error::*;
 use polars_utils::cache::FastFixedCache;
 #[cfg(feature = "aws")]
 use regex::Regex;
+#[cfg(feature = "http")]
+use reqwest::header::HeaderMap;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "aws")]
@@ -38,8 +40,6 @@ use url::Url;
 use crate::file_cache::get_env_file_cache_ttl;
 #[cfg(feature = "aws")]
 use crate::pl_async::with_concurrency_budget;
-#[cfg(feature = "aws")]
-use crate::utils::resolve_homedir;
 
 #[cfg(feature = "aws")]
 static BUCKET_REGION: Lazy<std::sync::Mutex<FastFixedCache<SmartString, SmartString>>> =
@@ -56,17 +56,25 @@ type Configs<T> = Vec<(T, String)>;
 
 #[derive(Clone, Debug, PartialEq, Hash, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub(crate) enum CloudConfig {
+    #[cfg(feature = "aws")]
+    Aws(Configs<AmazonS3ConfigKey>),
+    #[cfg(feature = "azure")]
+    Azure(Configs<AzureConfigKey>),
+    #[cfg(feature = "gcp")]
+    Gcp(Configs<GoogleConfigKey>),
+    #[cfg(feature = "http")]
+    Http { headers: Vec<(String, String)> },
+}
+
+#[derive(Clone, Debug, PartialEq, Hash, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 /// Options to connect to various cloud providers.
 pub struct CloudOptions {
     pub max_retries: usize,
     #[cfg(feature = "file_cache")]
     pub file_cache_ttl: u64,
-    #[cfg(feature = "aws")]
-    aws: Option<Configs<AmazonS3ConfigKey>>,
-    #[cfg(feature = "azure")]
-    azure: Option<Configs<AzureConfigKey>>,
-    #[cfg(feature = "gcp")]
-    gcp: Option<Configs<GoogleConfigKey>>,
+    pub(crate) config: Option<CloudConfig>,
 }
 
 impl Default for CloudOptions {
@@ -75,14 +83,27 @@ impl Default for CloudOptions {
             max_retries: 2,
             #[cfg(feature = "file_cache")]
             file_cache_ttl: get_env_file_cache_ttl(),
-            #[cfg(feature = "aws")]
-            aws: Default::default(),
-            #[cfg(feature = "azure")]
-            azure: Default::default(),
-            #[cfg(feature = "gcp")]
-            gcp: Default::default(),
+            config: None,
         }
     }
+}
+
+#[cfg(feature = "http")]
+pub(crate) fn try_build_http_header_map_from_items_slice<S: AsRef<str>>(
+    headers: &[(S, S)],
+) -> PolarsResult<HeaderMap> {
+    use reqwest::header::{HeaderName, HeaderValue};
+
+    let mut map = HeaderMap::with_capacity(headers.len());
+    for (k, v) in headers {
+        let (k, v) = (k.as_ref(), v.as_ref());
+        map.insert(
+            HeaderName::from_str(k).map_err(to_compute_err)?,
+            HeaderValue::from_str(v).map_err(to_compute_err)?,
+        );
+    }
+
+    Ok(map)
 }
 
 #[allow(dead_code)]
@@ -112,6 +133,7 @@ pub enum CloudType {
     File,
     Gcp,
     Http,
+    Hf,
 }
 
 impl CloudType {
@@ -123,6 +145,7 @@ impl CloudType {
             "gs" | "gcp" | "gcs" => Self::Gcp,
             "file" => Self::File,
             "http" | "https" => Self::Http,
+            "hf" => Self::Hf,
             _ => polars_bail!(ComputeError: "unknown url scheme"),
         })
     }
@@ -131,7 +154,11 @@ impl CloudType {
 #[cfg(feature = "cloud")]
 pub(crate) fn parse_url(input: &str) -> std::result::Result<url::Url, url::ParseError> {
     Ok(if input.contains("://") {
-        url::Url::parse(input)?
+        if input.starts_with("http://") || input.starts_with("https://") {
+            url::Url::parse(input)
+        } else {
+            url::Url::parse(&input.replace("%", "%25"))
+        }?
     } else {
         let path = std::path::Path::new(input);
         let mut tmp;
@@ -186,6 +213,8 @@ fn read_config(
     builder: &mut AmazonS3Builder,
     items: &[(&Path, &[(&str, AmazonS3ConfigKey)])],
 ) -> Option<()> {
+    use crate::path_utils::resolve_homedir;
+
     for (path, keys) in items {
         if keys
             .iter()
@@ -200,14 +229,12 @@ fn read_config(
         let content = std::str::from_utf8(buf.as_ref()).ok()?;
 
         for (pattern, key) in keys.iter() {
-            let local = std::mem::take(builder);
-
             if builder.get_config_value(key).is_none() {
                 let reg = Regex::new(pattern).unwrap();
                 let cap = reg.captures(content)?;
                 let m = cap.get(1)?;
                 let parsed = m.as_str();
-                *builder = local.with_config(*key, parsed)
+                *builder = std::mem::take(builder).with_config(*key, parsed);
             }
         }
     }
@@ -215,27 +242,32 @@ fn read_config(
 }
 
 impl CloudOptions {
+    /// Set the maximum number of retries.
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
     /// Set the configuration for AWS connections. This is the preferred API from rust.
     #[cfg(feature = "aws")]
     pub fn with_aws<I: IntoIterator<Item = (AmazonS3ConfigKey, impl Into<String>)>>(
         mut self,
         configs: I,
     ) -> Self {
-        self.aws = Some(
-            configs
-                .into_iter()
-                .map(|(k, v)| (k, v.into()))
-                .collect::<Configs<AmazonS3ConfigKey>>(),
-        );
+        self.config = Some(CloudConfig::Aws(
+            configs.into_iter().map(|(k, v)| (k, v.into())).collect(),
+        ));
         self
     }
 
     /// Build the [`object_store::ObjectStore`] implementation for AWS.
     #[cfg(feature = "aws")]
     pub async fn build_aws(&self, url: &str) -> PolarsResult<impl object_store::ObjectStore> {
-        let options = self.aws.as_ref();
         let mut builder = AmazonS3Builder::from_env().with_url(url);
-        if let Some(options) = options {
+        if let Some(options) = &self.config {
+            let CloudConfig::Aws(options) = options else {
+                panic!("impl error: cloud type mismatch")
+            };
             for (key, value) in options.iter() {
                 builder = builder.with_config(*key, value);
             }
@@ -269,7 +301,7 @@ impl CloudOptions {
                 .get_config_value(&AmazonS3ConfigKey::Region)
                 .is_none()
         {
-            let bucket = crate::cloud::CloudLocation::new(url)?.bucket;
+            let bucket = crate::cloud::CloudLocation::new(url, false)?.bucket;
             let region = {
                 let bucket_region = BUCKET_REGION.lock().unwrap();
                 bucket_region.get(bucket.as_str()).cloned()
@@ -324,21 +356,20 @@ impl CloudOptions {
         mut self,
         configs: I,
     ) -> Self {
-        self.azure = Some(
-            configs
-                .into_iter()
-                .map(|(k, v)| (k, v.into()))
-                .collect::<Configs<AzureConfigKey>>(),
-        );
+        self.config = Some(CloudConfig::Azure(
+            configs.into_iter().map(|(k, v)| (k, v.into())).collect(),
+        ));
         self
     }
 
     /// Build the [`object_store::ObjectStore`] implementation for Azure.
     #[cfg(feature = "azure")]
     pub fn build_azure(&self, url: &str) -> PolarsResult<impl object_store::ObjectStore> {
-        let options = self.azure.as_ref();
         let mut builder = MicrosoftAzureBuilder::from_env();
-        if let Some(options) = options {
+        if let Some(options) = &self.config {
+            let CloudConfig::Azure(options) = options else {
+                panic!("impl error: cloud type mismatch")
+            };
             for (key, value) in options.iter() {
                 builder = builder.with_config(*key, value);
             }
@@ -358,21 +389,20 @@ impl CloudOptions {
         mut self,
         configs: I,
     ) -> Self {
-        self.gcp = Some(
-            configs
-                .into_iter()
-                .map(|(k, v)| (k, v.into()))
-                .collect::<Configs<GoogleConfigKey>>(),
-        );
+        self.config = Some(CloudConfig::Gcp(
+            configs.into_iter().map(|(k, v)| (k, v.into())).collect(),
+        ));
         self
     }
 
     /// Build the [`object_store::ObjectStore`] implementation for GCP.
     #[cfg(feature = "gcp")]
     pub fn build_gcp(&self, url: &str) -> PolarsResult<impl object_store::ObjectStore> {
-        let options = self.gcp.as_ref();
         let mut builder = GoogleCloudStorageBuilder::from_env();
-        if let Some(options) = options {
+        if let Some(options) = &self.config {
+            let CloudConfig::Gcp(options) = options else {
+                panic!("impl error: cloud type mismatch")
+            };
             for (key, value) in options.iter() {
                 builder = builder.with_config(*key, value);
             }
@@ -382,6 +412,23 @@ impl CloudOptions {
             .with_client_options(get_client_options())
             .with_url(url)
             .with_retry(get_retry_config(self.max_retries))
+            .build()
+            .map_err(to_compute_err)
+    }
+
+    #[cfg(feature = "http")]
+    pub fn build_http(&self, url: &str) -> PolarsResult<impl object_store::ObjectStore> {
+        object_store::http::HttpBuilder::new()
+            .with_url(url)
+            .with_client_options({
+                let mut opts = super::get_client_options();
+                if let Some(CloudConfig::Http { headers }) = &self.config {
+                    opts = opts.with_default_headers(try_build_http_header_map_from_items_slice(
+                        headers.as_slice(),
+                    )?);
+                }
+                opts
+            })
             .build()
             .map_err(to_compute_err)
     }
@@ -426,6 +473,74 @@ impl CloudOptions {
                 #[cfg(not(feature = "gcp"))]
                 {
                     polars_bail!(ComputeError: "'gcp' feature is not enabled");
+                }
+            },
+            CloudType::Hf => {
+                #[cfg(feature = "http")]
+                {
+                    use polars_core::config;
+
+                    use crate::path_utils::resolve_homedir;
+
+                    let mut this = Self::default();
+                    let mut token = None;
+                    let verbose = config::verbose();
+
+                    for (i, (k, v)) in config.into_iter().enumerate() {
+                        let (k, v) = (k.as_ref(), v.into());
+
+                        if i == 0 && k == "token" {
+                            if verbose {
+                                eprintln!("HF token sourced from storage_options");
+                            }
+                            token = Some(v);
+                        } else {
+                            polars_bail!(ComputeError: "unknown configuration key for HF: {}", k)
+                        }
+                    }
+
+                    token = token
+                        .or_else(|| {
+                            let v = std::env::var("HF_TOKEN").ok();
+                            if v.is_some() && verbose {
+                                eprintln!("HF token sourced from HF_TOKEN env var");
+                            }
+                            v
+                        })
+                        .or_else(|| {
+                            let hf_home = std::env::var("HF_HOME");
+                            let hf_home = hf_home.as_deref();
+                            let hf_home = hf_home.unwrap_or("~/.cache/huggingface");
+                            let hf_home = resolve_homedir(std::path::Path::new(&hf_home));
+                            let cached_token_path = hf_home.join("token");
+
+                            let v = std::string::String::from_utf8(
+                                std::fs::read(&cached_token_path).ok()?,
+                            )
+                            .ok()
+                            .filter(|x| !x.is_empty());
+
+                            if v.is_some() && verbose {
+                                eprintln!(
+                                    "HF token sourced from {}",
+                                    cached_token_path.to_str().unwrap()
+                                );
+                            }
+
+                            v
+                        });
+
+                    if let Some(v) = token {
+                        this.config = Some(CloudConfig::Http {
+                            headers: vec![("Authorization".into(), format!("Bearer {}", v))],
+                        })
+                    }
+
+                    Ok(this)
+                }
+                #[cfg(not(feature = "http"))]
+                {
+                    polars_bail!(ComputeError: "'http' feature is not enabled");
                 }
             },
         }

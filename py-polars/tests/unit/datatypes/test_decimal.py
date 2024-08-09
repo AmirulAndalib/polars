@@ -60,7 +60,7 @@ def test_frame_from_pydecimal_and_ints(
         row_data = [(d,) for d in data]
         for cls in (X, Y):
             for ctor in (pl.DataFrame, pl.from_records):
-                df = ctor(data=list(map(cls, data)))  # type: ignore[operator]
+                df = ctor(data=list(map(cls, data)))
                 assert df.schema == {
                     "a": pl.Decimal(scale=7),
                 }
@@ -326,10 +326,40 @@ def test_decimal_aggregations() -> None:
         sum=pl.sum("a"),
         min=pl.min("a"),
         max=pl.max("a"),
+        mean=pl.mean("a"),
+        median=pl.median("a"),
     ).to_dict(as_series=False) == {
         "sum": [D("9110.33")],
         "min": [D("0.10")],
         "max": [D("9000.12")],
+        "mean": [2277.5825],
+        "median": [55.055],
+    }
+
+    assert df.describe().to_dict(as_series=False) == {
+        "statistic": [
+            "count",
+            "null_count",
+            "mean",
+            "std",
+            "min",
+            "25%",
+            "50%",
+            "75%",
+            "max",
+        ],
+        "g": [4.0, 0.0, 1.5, 0.5773502691896257, 1.0, 1.0, 2.0, 2.0, 2.0],
+        "a": [
+            4.0,
+            0.0,
+            2277.5825,
+            4481.916846516863,
+            0.1,
+            10.1,
+            100.01,
+            100.01,
+            9000.12,
+        ],
     }
 
 
@@ -485,3 +515,10 @@ def test_decimal_dynamic_float_st() -> None:
     assert pl.LazyFrame({"a": [D("2.0"), D("0.5")]}).filter(
         pl.col("a").is_between(0.45, 0.9)
     ).collect().to_dict(as_series=False) == {"a": [D("0.5")]}
+
+
+def test_decimal_strict_scale_inference_17770() -> None:
+    values = [D("0.1"), D("0.10"), D("1.0121")]
+    s = pl.Series(values, strict=True)
+    assert s.dtype == pl.Decimal(precision=None, scale=4)
+    assert s.to_list() == values

@@ -24,6 +24,7 @@ polars-utils = { workspace = true }
 
 ahash = { workspace = true }
 arrow = { workspace = true }
+bitflags = { workspace = true }
 bytemuck = { workspace = true }
 chrono = { workspace = true, optional = true }
 chrono-tz = { workspace = true, optional = true }
@@ -31,6 +32,7 @@ ciborium = { workspace = true, optional = true }
 either = { workspace = true }
 futures = { workspace = true, optional = true }
 hashbrown = { workspace = true }
+memmap = { workspace = true }
 once_cell = { workspace = true }
 percent-encoding = { workspace = true }
 pyo3 = { workspace = true, optional = true }
@@ -38,6 +40,7 @@ rayon = { workspace = true }
 recursive = { workspace = true }
 regex = { workspace = true, optional = true }
 serde = { workspace = true, features = ["rc"], optional = true }
+serde_json = { workspace = true, optional = true }
 smartstring = { workspace = true }
 strum_macros = { workspace = true }
 
@@ -179,6 +182,7 @@ month_end = ["polars-time/month_end"]
 offset_by = ["polars-time/offset_by"]
 
 bigidx = ["polars-core/bigidx"]
+polars_cloud = ["serde", "ciborium"]
 
 panic_on_schema = []
 

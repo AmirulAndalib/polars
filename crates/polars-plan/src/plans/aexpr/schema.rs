@@ -249,6 +249,8 @@ impl AExpr {
                 options,
                 ..
             } => {
+                *nested = nested
+                    .saturating_sub(options.flags.contains(FunctionFlags::RETURNS_SCALAR) as _);
                 let tmp = function.get_output();
                 let output_type = tmp.as_ref().unwrap_or(output_type);
                 let fields = func_args_to_fields(input, schema, arena, nested)?;
@@ -256,19 +258,17 @@ impl AExpr {
                 output_type.get_field(schema, Context::Default, &fields)
             },
             Function {
-                function, input, ..
+                function,
+                input,
+                options,
             } => {
+                *nested = nested
+                    .saturating_sub(options.flags.contains(FunctionFlags::RETURNS_SCALAR) as _);
                 let fields = func_args_to_fields(input, schema, arena, nested)?;
                 polars_ensure!(!fields.is_empty(), ComputeError: "expression: '{}' didn't get any inputs", function);
                 function.get_field(schema, Context::Default, &fields)
             },
             Slice { input, .. } => arena.get(*input).to_field_impl(schema, arena, nested),
-            Wildcard => {
-                polars_bail!(ComputeError: "wildcard column selection not supported at this point")
-            },
-            Nth(n) => {
-                polars_bail!(ComputeError: "nth column selection not supported at this point (n={})", n)
-            },
         }
     }
 }

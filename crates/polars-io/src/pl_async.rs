@@ -37,14 +37,16 @@ impl<T: GetSize, E: Error> GetSize for Result<T, E> {
     }
 }
 
+#[cfg(feature = "cloud")]
 pub(crate) struct Size(u64);
 
+#[cfg(feature = "cloud")]
 impl GetSize for Size {
     fn size(&self) -> u64 {
         self.0
     }
 }
-
+#[cfg(feature = "cloud")]
 impl From<u64> for Size {
     fn from(value: u64) -> Self {
         Self(value)
@@ -274,6 +276,15 @@ impl RuntimeManager {
         F::Output: Send + 'static,
     {
         self.rt.spawn(future)
+    }
+
+    // See [`tokio::runtime::Runtime::spawn_blocking`].
+    pub fn spawn_blocking<F, R>(&self, f: F) -> tokio::task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.rt.spawn_blocking(f)
     }
 }
 

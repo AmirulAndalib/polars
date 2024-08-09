@@ -242,7 +242,7 @@ impl SeriesTrait for SeriesWrap<DateChunked> {
                 .into_series()
                 .date()
                 .unwrap()
-                .to_string("%Y-%m-%d")
+                .to_string("%Y-%m-%d")?
                 .into_series()),
             #[cfg(feature = "dtype-datetime")]
             DataType::Datetime(_, _) => {
@@ -277,8 +277,8 @@ impl SeriesTrait for SeriesWrap<DateChunked> {
         self.0.null_count()
     }
 
-    fn has_validity(&self) -> bool {
-        self.0.has_validity()
+    fn has_nulls(&self) -> bool {
+        self.0.has_nulls()
     }
 
     #[cfg(feature = "algorithm_group_by")]

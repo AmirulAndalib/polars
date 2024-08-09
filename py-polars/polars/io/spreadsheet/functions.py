@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Callable, NoReturn, Sequence, overload
 
 import polars._reexport as pl
+from polars import from_arrow
 from polars import functions as F
 from polars._utils.deprecation import (
     deprecate_renamed_parameter,
@@ -169,6 +170,8 @@ def read_excel(
         Path to a file or a file-like object (by "file-like object" we refer to objects
         that have a `read()` method, such as a file handler like the builtin `open`
         function, or a `BytesIO` instance).
+        For file-like objects,
+        stream position may not be updated accordingly after reading.
     sheet_id
         Sheet number(s) to convert (set `0` to load all sheets as DataFrames) and
         return a `{sheetname:frame,}` dict. (Defaults to `1` if neither this nor
@@ -383,6 +386,8 @@ def read_ods(
         Path to a file or a file-like object (by "file-like object" we refer to objects
         that have a `read()` method, such as a file handler like the builtin `open`
         function, or a `BytesIO` instance).
+        For file-like objects,
+        stream position may not be updated accordingly after reading.
     sheet_id
         Sheet number(s) to convert, starting from 1 (set `0` to load *all* worksheets
         as DataFrames) and return a `{sheetname:frame,}` dict. (Defaults to `1` if
@@ -878,8 +883,12 @@ def _read_spreadsheet_calamine(
 
         read_options["dtypes"] = parser_dtypes
 
-    ws = parser.load_sheet_by_name(name=sheet_name, **read_options)
-    df = ws.to_polars()
+    if fastexcel_version < (0, 11, 2):
+        ws = parser.load_sheet_by_name(name=sheet_name, **read_options)
+        df = ws.to_polars()
+    else:
+        ws_arrow = parser.load_sheet_eager(sheet_name, **read_options)
+        df = from_arrow(ws_arrow)
 
     # note: even if we applied parser dtypes we still re-apply schema_overrides
     # natively as we can refine integer/float types, temporal precision, etc.

@@ -7,6 +7,9 @@ pub trait PhysicalIoExpr: Send + Sync {
     /// as a predicate mask
     fn evaluate_io(&self, df: &DataFrame) -> PolarsResult<Series>;
 
+    /// Get the variables that are used in the expression i.e. live variables.
+    fn live_variables(&self) -> Option<Vec<Arc<str>>>;
+
     /// Can take &dyn Statistics and determine of a file should be
     /// read -> `true`
     /// or not -> `false`
@@ -191,6 +194,7 @@ impl ColumnStats {
 /// Returns whether the [`DataType`] supports minimum/maximum operations.
 fn use_min_max(dtype: &DataType) -> bool {
     dtype.is_numeric()
+        || dtype.is_temporal()
         || matches!(
             dtype,
             DataType::String | DataType::Binary | DataType::Boolean

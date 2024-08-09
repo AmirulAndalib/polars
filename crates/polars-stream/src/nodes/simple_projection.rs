@@ -5,12 +5,16 @@ use polars_core::schema::Schema;
 use super::compute_node_prelude::*;
 
 pub struct SimpleProjectionNode {
-    schema: Arc<Schema>,
+    columns: Vec<String>,
+    input_schema: Arc<Schema>,
 }
 
 impl SimpleProjectionNode {
-    pub fn new(schema: Arc<Schema>) -> Self {
-        Self { schema }
+    pub fn new(columns: Vec<String>, input_schema: Arc<Schema>) -> Self {
+        Self {
+            columns,
+            input_schema,
+        }
     }
 }
 
@@ -25,30 +29,33 @@ impl ComputeNode for SimpleProjectionNode {
     }
 
     fn spawn<'env, 's>(
-        &'env self,
+        &'env mut self,
         scope: &'s TaskScope<'s, 'env>,
-        _pipeline: usize,
-        recv: &mut [Option<Receiver<Morsel>>],
-        send: &mut [Option<Sender<Morsel>>],
+        recv: &mut [Option<RecvPort<'_>>],
+        send: &mut [Option<SendPort<'_>>],
         _state: &'s ExecutionState,
-    ) -> JoinHandle<PolarsResult<()>> {
+        join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
+    ) {
         assert!(recv.len() == 1 && send.len() == 1);
-        let mut recv = recv[0].take().unwrap();
-        let mut send = send[0].take().unwrap();
+        let receivers = recv[0].take().unwrap().parallel();
+        let senders = send[0].take().unwrap().parallel();
 
-        scope.spawn_task(TaskPriority::High, async move {
-            while let Ok(morsel) = recv.recv().await {
-                let morsel = morsel.try_map(|df| {
-                    // TODO: can this be unchecked?
-                    df.select_with_schema(self.schema.iter_names(), &self.schema)
-                })?;
+        for (mut recv, mut send) in receivers.into_iter().zip(senders) {
+            let slf = &*self;
+            join_handles.push(scope.spawn_task(TaskPriority::High, async move {
+                while let Ok(morsel) = recv.recv().await {
+                    let morsel = morsel.try_map(|df| {
+                        // TODO: can this be unchecked?
+                        df.select_with_schema(&slf.columns, &slf.input_schema)
+                    })?;
 
-                if send.send(morsel).await.is_err() {
-                    break;
+                    if send.send(morsel).await.is_err() {
+                        break;
+                    }
                 }
-            }
 
-            Ok(())
-        })
+                Ok(())
+            }));
+        }
     }
 }

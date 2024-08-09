@@ -148,6 +148,7 @@ from polars.functions import (
     when,
     zeros,
 )
+from polars.interchange import CompatLevel
 from polars.io import (
     read_avro,
     read_clipboard,
@@ -173,7 +174,7 @@ from polars.io import (
     scan_parquet,
     scan_pyarrow_dataset,
 )
-from polars.lazyframe import LazyFrame
+from polars.lazyframe import GPUEngine, LazyFrame
 from polars.meta import (
     build_info,
     get_index_type,
@@ -205,6 +206,8 @@ __all__ = [
     "Expr",
     "LazyFrame",
     "Series",
+    # Engine configuration
+    "GPUEngine",
     # schema
     "Schema",
     # datatypes
@@ -317,8 +320,6 @@ __all__ = [
     "cum_count",
     "cum_fold",
     "cum_reduce",
-    "cumfold",
-    "cumreduce",
     "date",
     "datetime",
     "duration",
@@ -375,6 +376,7 @@ __all__ = [
     "SQLContext",
     "sql",
     "sql_expr",
+    "CompatLevel",
 ]
 
 

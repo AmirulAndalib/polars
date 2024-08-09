@@ -1025,7 +1025,7 @@ class ExprStringNameSpace:
         --------
         >>> df = pl.DataFrame(
         ...     {
-        ...         "txt": ["Crab", "Lobster", None, "Crustaceon"],
+        ...         "txt": ["Crab", "Lobster", None, "Crustacean"],
         ...         "pat": ["a[bc]", "b.t", "[aeiuo]", "(?i)A[BC]"],
         ...     }
         ... )
@@ -1046,7 +1046,7 @@ class ExprStringNameSpace:
         │ Crab       ┆ 2           ┆ null    │
         │ Lobster    ┆ 5           ┆ 5       │
         │ null       ┆ null        ┆ null    │
-        │ Crustaceon ┆ 5           ┆ 7       │
+        │ Crustacean ┆ 5           ┆ 7       │
         └────────────┴─────────────┴─────────┘
 
         Match against a pattern found in another column or (expression):
@@ -1061,7 +1061,7 @@ class ExprStringNameSpace:
         │ Crab       ┆ a[bc]     ┆ 2        │
         │ Lobster    ┆ b.t       ┆ 2        │
         │ null       ┆ [aeiuo]   ┆ null     │
-        │ Crustaceon ┆ (?i)A[BC] ┆ 5        │
+        │ Crustacean ┆ (?i)A[BC] ┆ 5        │
         └────────────┴───────────┴──────────┘
         """
         pattern = parse_into_expression(pattern, str_as_lit=True)
@@ -1226,15 +1226,15 @@ class ExprStringNameSpace:
         >>> dtype = pl.Struct([pl.Field("a", pl.Int64), pl.Field("b", pl.Boolean)])
         >>> df.with_columns(decoded=pl.col("json").str.json_decode(dtype))
         shape: (3, 2)
-        ┌─────────────────────┬─────────────┐
-        │ json                ┆ decoded     │
-        │ ---                 ┆ ---         │
-        │ str                 ┆ struct[2]   │
-        ╞═════════════════════╪═════════════╡
-        │ {"a":1, "b": true}  ┆ {1,true}    │
-        │ null                ┆ {null,null} │
-        │ {"a":2, "b": false} ┆ {2,false}   │
-        └─────────────────────┴─────────────┘
+        ┌─────────────────────┬───────────┐
+        │ json                ┆ decoded   │
+        │ ---                 ┆ ---       │
+        │ str                 ┆ struct[2] │
+        ╞═════════════════════╪═══════════╡
+        │ {"a":1, "b": true}  ┆ {1,true}  │
+        │ null                ┆ null      │
+        │ {"a":2, "b": false} ┆ {2,false} │
+        └─────────────────────┴───────────┘
         """
         if dtype is not None:
             dtype = parse_into_dtype(dtype)
@@ -2394,7 +2394,7 @@ class ExprStringNameSpace:
         patterns
             String patterns to search.
         ascii_case_insensitive
-            Enable ASCII-aware case insensitive matching.
+            Enable ASCII-aware case-insensitive matching.
             When this option is enabled, searching will be performed without respect
             to case for ASCII letters (a-z and A-Z) only.
 
@@ -2448,9 +2448,9 @@ class ExprStringNameSpace:
             String patterns to search and replace.
         replace_with
             Strings to replace where a pattern was a match.
-            This can be broadcasted. So it supports many:one and many:many.
+            This can be broadcast, so it supports many:one and many:many.
         ascii_case_insensitive
-            Enable ASCII-aware case insensitive matching.
+            Enable ASCII-aware case-insensitive matching.
             When this option is enabled, searching will be performed without respect
             to case for ASCII letters (a-z and A-Z) only.
 
@@ -2532,7 +2532,7 @@ class ExprStringNameSpace:
         patterns
             String patterns to search.
         ascii_case_insensitive
-            Enable ASCII-aware case insensitive matching.
+            Enable ASCII-aware case-insensitive matching.
             When this option is enabled, searching will be performed without respect
             to case for ASCII letters (a-z and A-Z) only.
         overlapping

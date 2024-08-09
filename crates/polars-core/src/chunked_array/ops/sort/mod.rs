@@ -216,10 +216,11 @@ where
     }
 }
 
-fn arg_sort_numeric<T>(ca: &ChunkedArray<T>, options: SortOptions) -> IdxCa
+fn arg_sort_numeric<T>(ca: &ChunkedArray<T>, mut options: SortOptions) -> IdxCa
 where
     T: PolarsNumericType,
 {
+    options.multithreaded &= POOL.current_num_threads() > 1;
     if ca.null_count() == 0 {
         let iter = ca
             .downcast_iter()
@@ -238,7 +239,8 @@ fn arg_sort_multiple_numeric<T: PolarsNumericType>(
     by: &[Series],
     options: &SortMultipleOptions,
 ) -> PolarsResult<IdxCa> {
-    args_validate(ca, by, &options.descending)?;
+    args_validate(ca, by, &options.descending, "descending")?;
+    args_validate(ca, by, &options.nulls_last, "nulls_last")?;
     let mut count: IdxSize = 0;
 
     let no_nulls = ca.null_count() == 0;
@@ -270,7 +272,8 @@ impl<T> ChunkSort<T> for ChunkedArray<T>
 where
     T: PolarsNumericType,
 {
-    fn sort_with(&self, options: SortOptions) -> ChunkedArray<T> {
+    fn sort_with(&self, mut options: SortOptions) -> ChunkedArray<T> {
+        options.multithreaded &= POOL.current_num_threads() > 1;
         sort_with_numeric(self, options)
     }
 
@@ -354,7 +357,8 @@ impl ChunkSort<StringType> for StringChunked {
 }
 
 impl ChunkSort<BinaryType> for BinaryChunked {
-    fn sort_with(&self, options: SortOptions) -> ChunkedArray<BinaryType> {
+    fn sort_with(&self, mut options: SortOptions) -> ChunkedArray<BinaryType> {
+        options.multithreaded &= POOL.current_num_threads() > 1;
         sort_with_fast_path!(self, options);
         // We will sort by the views and reconstruct with sorted views. We leave the buffers as is.
         // We must rechunk to ensure that all views point into the proper buffers.
@@ -426,8 +430,8 @@ impl ChunkSort<BinaryType> for BinaryChunked {
         by: &[Series],
         options: &SortMultipleOptions,
     ) -> PolarsResult<IdxCa> {
-        args_validate(self, by, &options.descending)?;
-
+        args_validate(self, by, &options.descending, "descending")?;
+        args_validate(self, by, &options.nulls_last, "nulls_last")?;
         let mut count: IdxSize = 0;
 
         let mut vals = Vec::with_capacity(self.len());
@@ -444,7 +448,8 @@ impl ChunkSort<BinaryType> for BinaryChunked {
 }
 
 impl ChunkSort<BinaryOffsetType> for BinaryOffsetChunked {
-    fn sort_with(&self, options: SortOptions) -> BinaryOffsetChunked {
+    fn sort_with(&self, mut options: SortOptions) -> BinaryOffsetChunked {
+        options.multithreaded &= POOL.current_num_threads() > 1;
         sort_with_fast_path!(self, options);
 
         let mut v: Vec<&[u8]> = Vec::with_capacity(self.len());
@@ -531,7 +536,8 @@ impl ChunkSort<BinaryOffsetType> for BinaryOffsetChunked {
         })
     }
 
-    fn arg_sort(&self, options: SortOptions) -> IdxCa {
+    fn arg_sort(&self, mut options: SortOptions) -> IdxCa {
+        options.multithreaded &= POOL.current_num_threads() > 1;
         let ca = self.rechunk();
         let arr = ca.downcast_into_array();
         let mut idx = (0..(arr.len() as IdxSize)).collect::<Vec<_>>();
@@ -568,8 +574,8 @@ impl ChunkSort<BinaryOffsetType> for BinaryOffsetChunked {
         by: &[Series],
         options: &SortMultipleOptions,
     ) -> PolarsResult<IdxCa> {
-        args_validate(self, by, &options.descending)?;
-
+        args_validate(self, by, &options.descending, "descending")?;
+        args_validate(self, by, &options.nulls_last, "nulls_last")?;
         let mut count: IdxSize = 0;
 
         let mut vals = Vec::with_capacity(self.len());
@@ -599,8 +605,27 @@ impl StructChunked {
     }
 }
 
+#[cfg(feature = "dtype-struct")]
+impl ChunkSort<StructType> for StructChunked {
+    fn sort_with(&self, mut options: SortOptions) -> ChunkedArray<StructType> {
+        options.multithreaded &= POOL.current_num_threads() > 1;
+        let idx = self.arg_sort(options);
+        unsafe { self.take_unchecked(&idx) }
+    }
+
+    fn sort(&self, descending: bool) -> ChunkedArray<StructType> {
+        self.sort_with(SortOptions::new().with_order_descending(descending))
+    }
+
+    fn arg_sort(&self, options: SortOptions) -> IdxCa {
+        let bin = self.get_row_encoded(options).unwrap();
+        bin.arg_sort(Default::default())
+    }
+}
+
 impl ChunkSort<BooleanType> for BooleanChunked {
-    fn sort_with(&self, options: SortOptions) -> ChunkedArray<BooleanType> {
+    fn sort_with(&self, mut options: SortOptions) -> ChunkedArray<BooleanType> {
+        options.multithreaded &= POOL.current_num_threads() > 1;
         sort_with_fast_path!(self, options);
         assert!(
             !options.nulls_last,
@@ -610,10 +635,10 @@ impl ChunkSort<BooleanType> for BooleanChunked {
             let len = self.len();
             let n_set = self.sum().unwrap() as usize;
             let mut bitmap = MutableBitmap::with_capacity(len);
-            let (first, second) = if options.descending {
-                (true, false)
+            let (first, second, n_set) = if options.descending {
+                (true, false, len - n_set)
             } else {
-                (false, true)
+                (false, true, n_set)
             };
             bitmap.extend_constant(len - n_set, first);
             bitmap.extend_constant(n_set, second);
@@ -687,16 +712,18 @@ pub(crate) fn convert_sort_column_multi_sort(s: &Series) -> PolarsResult<Series>
         Categorical(_, _) | Enum(_, _) => s.rechunk(),
         Binary | Boolean => s.clone(),
         BinaryOffset => s.clone(),
-        String => s.cast(&Binary).unwrap(),
+        String => s.str().unwrap().as_binary().into_series(),
         #[cfg(feature = "dtype-struct")]
         Struct(_) => {
             let ca = s.struct_().unwrap();
             let new_fields = ca
-                .fields()
+                .fields_as_series()
                 .iter()
                 .map(convert_sort_column_multi_sort)
                 .collect::<PolarsResult<Vec<_>>>()?;
-            return StructChunked::new(ca.name(), &new_fields).map(|ca| ca.into_series());
+            let mut out = StructChunked::from_series(ca.name(), &new_fields)?;
+            out.zip_outer_validity(ca);
+            out.into_series()
         },
         // we could fallback to default branch, but decimal is not numeric dtype for now, so explicit here
         #[cfg(feature = "dtype-decimal")]
@@ -832,6 +859,11 @@ mod test {
                 None
             ]
         );
+        let b = BooleanChunked::new("b", &[Some(false), Some(true), Some(false)]);
+        let out = b.sort_with(SortOptions::default().with_order_descending(true));
+        assert_eq!(Vec::from(&out), &[Some(true), Some(false), Some(false)]);
+        let out = b.sort_with(SortOptions::default().with_order_descending(false));
+        assert_eq!(Vec::from(&out), &[Some(false), Some(false), Some(true)]);
     }
 
     #[test]

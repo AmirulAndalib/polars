@@ -21,6 +21,7 @@ use polars_utils::format_pl_smallstr;
 use polars_utils::pl_str::PlSmallStr;
 use polars_utils::slice_enum::Slice;
 use reader_interface::builder::FileReaderBuilder;
+use reader_interface::capabilities::ReaderCapabilities;
 
 use crate::async_executor::{self, AbortOnDropHandle, TaskPriority};
 use crate::async_primitives::connector;
@@ -77,6 +78,14 @@ impl MultiFileReaderConfig {
     fn max_concurrent_scans(&self) -> usize {
         self.max_concurrent_scans
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reader_capabilities(&self) -> ReaderCapabilities {
+        if std::env::var("POLARS_FORCE_EMPTY_READER_CAPABILITIES").as_deref() == Ok("1") {
+            ReaderCapabilities::empty()
+        } else {
+            self.file_reader_builder.reader_capabilities()
+        }
     }
 }
 
@@ -308,7 +317,7 @@ fn calc_n_readers_pre_init(num_pipelines: usize, config: &MultiFileReaderConfig)
         x.parse::<usize>()
             .ok()
             .filter(|x| *x > 0)
-            .unwrap_or_else(|| panic!("invalid value for POLARS_NUM_READERS_PRE_INIT: {}", x))
+            .unwrap_or_else(|| panic!("invalid value for POLARS_NUM_READERS_PRE_INIT: {x}"))
     }) {
         return v;
     }
@@ -332,7 +341,7 @@ fn calc_max_concurrent_scans(num_pipelines: usize, config: &MultiFileReaderConfi
         x.parse::<usize>()
             .ok()
             .filter(|x| *x > 0)
-            .unwrap_or_else(|| panic!("invalid value for POLARS_MAX_CONCURRENT_SCANS: {}", x))
+            .unwrap_or_else(|| panic!("invalid value for POLARS_MAX_CONCURRENT_SCANS: {x}"))
     }) {
         return v;
     }

@@ -49,6 +49,7 @@ use crate::series::IsSorted;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Hash, IntoStaticStr)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 #[strum(serialize_all = "snake_case")]
 pub enum UniqueKeepStrategy {
     /// Keep the first unique row.
@@ -282,7 +283,7 @@ impl DataFrame {
     /// ```
     pub fn new(columns: Vec<Column>) -> PolarsResult<Self> {
         DataFrame::validate_columns_slice(&columns)
-            .map_err(|e| e.wrap_msg(|e| format!("could not create a new DataFrame: {}", e)))?;
+            .map_err(|e| e.wrap_msg(|e| format!("could not create a new DataFrame: {e}")))?;
         Ok(unsafe { Self::new_no_checks_height_from_first(columns) })
     }
 
@@ -1885,6 +1886,17 @@ impl DataFrame {
         Ok(unsafe { DataFrame::new_no_checks(self.height(), selected) })
     }
 
+    pub fn project(&self, to: SchemaRef) -> PolarsResult<Self> {
+        let from = self.schema();
+        let columns = to
+            .iter_names()
+            .map(|name| Ok(self.columns[from.try_index_of(name.as_str())?].clone()))
+            .collect::<PolarsResult<Vec<_>>>()?;
+        let mut df = unsafe { Self::new_no_checks(self.height(), columns) };
+        df.cached_schema = to.into();
+        Ok(df)
+    }
+
     /// Select column(s) from this [`DataFrame`] and return them into a [`Vec`].
     ///
     /// # Example
@@ -2077,6 +2089,8 @@ impl DataFrame {
             .and_then(|idx| self.columns.get_mut(idx))
             .ok_or_else(|| polars_err!(col_not_found = column))
             .map(|c| c.rename(name))?;
+        self.clear_schema();
+
         Ok(self)
     }
 

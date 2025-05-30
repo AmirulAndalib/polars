@@ -49,7 +49,7 @@ impl FunctionExpr {
             #[cfg(feature = "index_of")]
             IndexOf => mapper.with_dtype(IDX_DTYPE),
             #[cfg(feature = "search_sorted")]
-            SearchSorted(_) => mapper.with_dtype(IDX_DTYPE),
+            SearchSorted { .. } => mapper.with_dtype(IDX_DTYPE),
             #[cfg(feature = "range")]
             Range(func) => func.get_field(mapper),
             #[cfg(feature = "trigonometry")]
@@ -100,10 +100,17 @@ impl FunctionExpr {
                 _ => IDX_DTYPE,
             }),
             #[cfg(feature = "dtype-struct")]
-            AsStruct => Ok(Field::new(
-                fields[0].name().clone(),
-                DataType::Struct(fields.to_vec()),
-            )),
+            AsStruct => {
+                let mut field_names = PlHashSet::with_capacity(fields.len() - 1);
+                let struct_fields = fields.iter().map(|f| {
+                    polars_ensure!(field_names.insert(f.name.as_str()), duplicate_field = f.name());
+                    Ok(f.clone())
+                }).collect::<PolarsResult<Vec<_>>>()?;
+                Ok(Field::new(
+                    fields[0].name().clone(),
+                    DataType::Struct(struct_fields),
+                ))
+            },
             #[cfg(feature = "top_k")]
             TopK { .. } => mapper.with_same_dtype(),
             #[cfg(feature = "top_k")]

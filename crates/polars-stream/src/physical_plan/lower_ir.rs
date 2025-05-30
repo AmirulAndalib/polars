@@ -19,6 +19,7 @@ use polars_plan::prelude::GroupbyOptions;
 use polars_utils::arena::{Arena, Node};
 use polars_utils::itertools::Itertools;
 use polars_utils::slice_enum::Slice;
+use polars_utils::unique_id::UniqueId;
 use polars_utils::{IdxSize, unique_column_name};
 use slotmap::SlotMap;
 
@@ -124,7 +125,7 @@ pub fn lower_ir(
     phys_sm: &mut SlotMap<PhysNodeKey, PhysNode>,
     schema_cache: &mut PlHashMap<Node, Arc<Schema>>,
     expr_cache: &mut ExprCache,
-    cache_nodes: &mut PlHashMap<usize, PhysStream>,
+    cache_nodes: &mut PlHashMap<UniqueId, PhysStream>,
     ctx: StreamingLowerIRContext,
 ) -> PolarsResult<PhysStream> {
     // Helper macro to simplify recursive calls.
@@ -276,6 +277,8 @@ pub fn lower_ir(
                 variant,
                 file_type,
                 cloud_options,
+                per_partition_sort_by,
+                finish_callback,
             }) => {
                 let base_path = base_path.clone();
                 let file_path_cb = file_path_cb.clone();
@@ -283,6 +286,8 @@ pub fn lower_ir(
                 let variant = variant.clone();
                 let file_type = file_type.clone();
                 let cloud_options = cloud_options.clone();
+                let per_partition_sort_by = per_partition_sort_by.clone();
+                let finish_callback = finish_callback.clone();
 
                 let mut input = lower_ir!(*input)?;
                 match &variant {
@@ -324,13 +329,15 @@ pub fn lower_ir(
                 };
 
                 PhysNodeKind::PartitionSink {
+                    input,
                     base_path,
                     file_path_cb,
                     sink_options,
                     variant,
                     file_type,
-                    input,
                     cloud_options,
+                    per_partition_sort_by,
+                    finish_callback,
                 }
             },
         },
@@ -574,13 +581,20 @@ pub fn lower_ir(
                                 .as_ref()
                                 .map(|x| x.as_str()),
                         );
-                    let has_projection = unified_scan_args.projection.is_some();
 
-                    // TODO: Add this to unified scan args.
-                    let extra_columns_policy = if has_projection {
-                        ExtraColumnsPolicy::Ignore
-                    } else {
-                        ExtraColumnsPolicy::Raise
+                    // TODO: We ignore the parameter for some scan types to maintain old behavior,
+                    // as they currently don't expose an API for it to be configured.
+                    let extra_columns_policy = match &*scan_type {
+                        #[cfg(feature = "parquet")]
+                        FileScan::Parquet { .. } => unified_scan_args.extra_columns_policy,
+
+                        _ => {
+                            if unified_scan_args.projection.is_some() {
+                                ExtraColumnsPolicy::Ignore
+                            } else {
+                                ExtraColumnsPolicy::Raise
+                            }
+                        },
                     };
 
                     let mut multi_scan_node = PhysNodeKind::MultiScan {
@@ -772,7 +786,7 @@ pub fn lower_ir(
             id,
             cache_hits: _,
         } => {
-            let id = *id;
+            let id = id.clone();
             if let Some(cached) = cache_nodes.get(&id) {
                 return Ok(*cached);
             }

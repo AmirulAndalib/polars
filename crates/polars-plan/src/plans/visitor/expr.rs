@@ -91,6 +91,7 @@ impl TreeWalker for Expr {
             AnonymousFunction { input, function, output_type, options } => {
                 AnonymousFunction { input: input.into_iter().map(f).collect::<Result<_, _>>()?, function, output_type, options }
             },
+            Eval { expr: input, evaluation, variant } => Eval { expr: am(input, &mut f)?, evaluation: am(evaluation, f)?, variant },
             SubPlan(_, _) => self,
             Selector(_) => self,
         };
@@ -163,7 +164,6 @@ impl AExpr {
     fn is_equal_node(&self, other: &Self) -> bool {
         use AExpr::*;
         match (self, other) {
-            (Alias(_, l), Alias(_, r)) => l == r,
             (Column(l), Column(r)) => l == r,
             (Literal(l), Literal(r)) => l == r,
             (Window { options: l, .. }, Window { options: r, .. }) => l == r,

@@ -45,7 +45,11 @@ from polars._utils.various import (
 from polars.datatypes import Int64, is_polars_dtype, parse_into_dtype
 from polars.dependencies import _check_for_numpy
 from polars.dependencies import numpy as np
-from polars.exceptions import CustomUFuncWarning, PolarsInefficientMapWarning
+from polars.exceptions import (
+    CustomUFuncWarning,
+    OutOfBoundsError,
+    PolarsInefficientMapWarning,
+)
 from polars.expr.array import ExprArrayNameSpace
 from polars.expr.binary import ExprBinaryNameSpace
 from polars.expr.categorical import ExprCatNameSpace
@@ -296,6 +300,26 @@ class Expr:
             raise NotImplementedError(msg)
         # Numpy/Scipy ufuncs have signature None but numba signatures always exists.
         is_custom_ufunc = getattr(ufunc, "signature") is not None  # noqa: B009
+        if is_custom_ufunc is True:
+            msg = (
+                "Native numpy ufuncs are dispatched using `map_batches(ufunc, is_elementwise=True)` which "
+                "is safe for native Numpy and Scipy ufuncs but custom ufuncs in a group_by "
+                "context won't be properly grouped. Custom ufuncs are dispatched with is_elementwise=False. "
+                f"If {ufunc.__name__} needs elementwise then please use map_batches directly."
+            )
+            warnings.warn(
+                msg,
+                CustomUFuncWarning,
+                stacklevel=find_stacklevel(),
+            )
+        if len(inputs) == 1 and len(kwargs) == 0:
+            # if there is only 1 input then it must be an Expr for this func to
+            # have been called. If there are no kwargs then call map_batches
+            # directly on the ufunc
+            if not isinstance(inputs[0], Expr):
+                msg = "Input must be expression."
+                raise OutOfBoundsError(msg)
+            return inputs[0].map_batches(ufunc, is_elementwise=not is_custom_ufunc)
         num_expr = sum(isinstance(inp, Expr) for inp in inputs)
         exprs = [
             (inp, True, i) if isinstance(inp, Expr) else (inp, False, i)
@@ -330,20 +354,7 @@ class Expr:
                     args.append(expr[0])
             return ufunc(*args, **kwargs)
 
-        if is_custom_ufunc is True:
-            msg = (
-                "Native numpy ufuncs are dispatched using `map_batches(ufunc, is_elementwise=True)` which "
-                "is safe for native Numpy and Scipy ufuncs but custom ufuncs in a group_by "
-                "context won't be properly grouped. Custom ufuncs are dispatched with is_elementwise=False. "
-                f"If {ufunc.__name__} needs elementwise then please use map_batches directly."
-            )
-            warnings.warn(
-                msg,
-                CustomUFuncWarning,
-                stacklevel=find_stacklevel(),
-            )
-            return root_expr.map_batches(function, is_elementwise=False)
-        return root_expr.map_batches(function, is_elementwise=True)
+        return root_expr.map_batches(function, is_elementwise=not is_custom_ufunc)
 
     @classmethod
     def deserialize(
@@ -2399,7 +2410,11 @@ class Expr:
         return self._from_pyexpr(self._pyexpr.index_of(element))
 
     def search_sorted(
-        self, element: IntoExpr | np.ndarray[Any, Any], side: SearchSortedSide = "any"
+        self,
+        element: IntoExpr | np.ndarray[Any, Any],
+        side: SearchSortedSide = "any",
+        *,
+        descending: bool = False,
     ) -> Expr:
         """
         Find indices where elements should be inserted to maintain order.
@@ -2414,6 +2429,9 @@ class Expr:
             If 'any', the index of the first suitable location found is given.
             If 'left', the index of the leftmost suitable location found is given.
             If 'right', return the rightmost suitable location found is given.
+        descending
+            Boolean indicating whether the values are descending or not (they
+            are required to be sorted either way).
 
         Examples
         --------
@@ -2439,7 +2457,7 @@ class Expr:
         └──────┴───────┴─────┘
         """
         element = parse_into_expression(element, str_as_lit=True, list_as_series=True)  # type: ignore[arg-type]
-        return self._from_pyexpr(self._pyexpr.search_sorted(element, side))
+        return self._from_pyexpr(self._pyexpr.search_sorted(element, side, descending))
 
     def sort_by(
         self,
@@ -10190,9 +10208,7 @@ class Expr:
 
     @unstable()
     @deprecate_renamed_parameter("min_periods", "min_samples", version="1.21.0")
-    def cumulative_eval(
-        self, expr: Expr, *, min_samples: int = 1, parallel: bool = False
-    ) -> Expr:
+    def cumulative_eval(self, expr: Expr, *, min_samples: int = 1) -> Expr:
         """
         Run an expression over a sliding window that increases `1` slot every iteration.
 
@@ -10210,9 +10226,6 @@ class Expr:
         min_samples
             Number of valid values there should be in the window before the expression
             is evaluated. valid values = `length - null_count`
-        parallel
-            Run in parallel. Don't do this in a group by or another operation that
-            already has much parallelization.
 
         Warnings
         --------
@@ -10243,7 +10256,7 @@ class Expr:
         └────────┘
         """
         return self._from_pyexpr(
-            self._pyexpr.cumulative_eval(expr._pyexpr, min_samples, parallel)
+            self._pyexpr.cumulative_eval(expr._pyexpr, min_samples)
         )
 
     def set_sorted(self, *, descending: bool = False) -> Expr:

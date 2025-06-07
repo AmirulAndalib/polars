@@ -2,15 +2,9 @@ use super::*;
 use crate::prelude::*;
 pub type DateChunked = Logical<DateType, Int32Type>;
 
-impl From<Int32Chunked> for DateChunked {
-    fn from(ca: Int32Chunked) -> Self {
-        DateChunked::new_logical(ca)
-    }
-}
-
 impl Int32Chunked {
     pub fn into_date(self) -> DateChunked {
-        DateChunked::new_logical(self)
+        DateChunked::new_logical(self, DataType::Date)
     }
 }
 
@@ -44,7 +38,9 @@ impl LogicalType for DateChunked {
                     TimeUnit::Microseconds => US_IN_DAY,
                     TimeUnit::Milliseconds => MS_IN_DAY,
                 };
-                Ok((casted.deref() * conversion)
+                Ok(casted
+                    .deref()
+                    .checked_mul_scalar(conversion)
                     .into_datetime(*tu, tz.clone())
                     .into_series())
             },

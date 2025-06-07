@@ -862,12 +862,12 @@ def test_compat_level(monkeypatch: pytest.MonkeyPatch) -> None:
         df.to_arrow(compat_level=newest)["bin_col"][0], pa.BinaryViewScalar
     )
 
-    assert len(df.write_ipc(None).getbuffer()) == 786
-    assert len(df.write_ipc(None, compat_level=oldest).getbuffer()) == 914
-    assert len(df.write_ipc(None, compat_level=newest).getbuffer()) == 786
-    assert len(df.write_ipc_stream(None).getbuffer()) == 544
-    assert len(df.write_ipc_stream(None, compat_level=oldest).getbuffer()) == 672
-    assert len(df.write_ipc_stream(None, compat_level=newest).getbuffer()) == 544
+    assert len(df.write_ipc(None).getbuffer()) == 738
+    assert len(df.write_ipc(None, compat_level=oldest).getbuffer()) == 866
+    assert len(df.write_ipc(None, compat_level=newest).getbuffer()) == 738
+    assert len(df.write_ipc_stream(None).getbuffer()) == 520
+    assert len(df.write_ipc_stream(None, compat_level=oldest).getbuffer()) == 648
+    assert len(df.write_ipc_stream(None, compat_level=newest).getbuffer()) == 520
 
 
 def test_df_pycapsule_interface() -> None:
@@ -938,3 +938,17 @@ def test_from_arrow_string_cache_20271() -> None:
 def test_to_arrow_empty_chunks_20627() -> None:
     df = pl.concat(2 * [pl.Series([1])]).filter(pl.Series([False, True])).to_frame()
     assert df.to_arrow().shape == (1, 1)
+
+
+def test_arrow_c_array_object_no_unnest_23068() -> None:
+    class ArrowLike:
+        def __init__(self, pa_array: pa.Array) -> None:
+            self.pa_array = pa_array
+
+        def __arrow_c_array__(self, requested_schema: Any = None) -> Any:
+            return self.pa_array.__arrow_c_array__(requested_schema)
+
+    data = [1, 2, 3]
+    result = cast(pl.DataFrame, pl.from_arrow(ArrowLike(pa.array(data)))).to_series()
+    expected = pl.Series(data)
+    assert_series_equal(result, expected)

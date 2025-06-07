@@ -17,6 +17,7 @@ pub mod binary;
 mod bitwise;
 mod builder_dsl;
 pub use builder_dsl::*;
+mod datatype_expr;
 #[cfg(feature = "temporal")]
 pub mod dt;
 mod expr;
@@ -50,6 +51,7 @@ mod plan;
 pub use arity::*;
 #[cfg(feature = "dtype-array")]
 pub use array::*;
+pub use datatype_expr::DataTypeExpr;
 pub use expr::*;
 pub use function_expr::schema::FieldsMapper;
 pub use function_expr::*;
@@ -68,7 +70,11 @@ use polars_core::prelude::*;
 use polars_core::series::IsSorted;
 #[cfg(feature = "diff")]
 use polars_core::series::ops::NullBehavior;
-#[cfg(any(feature = "search_sorted", feature = "is_between"))]
+#[cfg(any(
+    feature = "search_sorted",
+    feature = "is_between",
+    feature = "list_sets"
+))]
 use polars_core::utils::SuperTypeFlags;
 use polars_core::utils::{SuperTypeOptions, try_get_supertype};
 pub use selector::Selector;
@@ -372,35 +378,47 @@ impl Expr {
 
     #[cfg(feature = "search_sorted")]
     /// Find indices where elements should be inserted to maintain order.
-    pub fn search_sorted<E: Into<Expr>>(self, element: E, side: SearchSortedSide) -> Expr {
-        self.map_binary(FunctionExpr::SearchSorted(side), element.into())
+    pub fn search_sorted<E: Into<Expr>>(
+        self,
+        element: E,
+        side: SearchSortedSide,
+        descending: bool,
+    ) -> Expr {
+        self.map_binary(
+            FunctionExpr::SearchSorted { side, descending },
+            element.into(),
+        )
     }
 
     /// Cast expression to another data type.
     /// Throws an error if conversion had overflows.
     /// Returns an Error if cast is invalid on rows after predicates are pushed down.
-    pub fn strict_cast(self, dtype: DataType) -> Self {
+    pub fn strict_cast(self, dtype: impl Into<DataTypeExpr>) -> Self {
         Expr::Cast {
             expr: Arc::new(self),
-            dtype,
+            dtype: dtype.into(),
             options: CastOptions::Strict,
         }
     }
 
     /// Cast expression to another data type.
-    pub fn cast(self, dtype: DataType) -> Self {
+    pub fn cast(self, dtype: impl Into<DataTypeExpr>) -> Self {
         Expr::Cast {
             expr: Arc::new(self),
-            dtype,
+            dtype: dtype.into(),
             options: CastOptions::NonStrict,
         }
     }
 
     /// Cast expression to another data type.
-    pub fn cast_with_options(self, dtype: DataType, cast_options: CastOptions) -> Self {
+    pub fn cast_with_options(
+        self,
+        dtype: impl Into<DataTypeExpr>,
+        cast_options: CastOptions,
+    ) -> Self {
         Expr::Cast {
             expr: Arc::new(self),
-            dtype,
+            dtype: dtype.into(),
             options: cast_options,
         }
     }
@@ -496,7 +514,6 @@ impl Expr {
     /// Returns the `k` smallest rows by given column.
     ///
     /// For single column, use [`Expr::bottom_k`].
-    // #[cfg(feature = "top_k")]
     #[cfg(feature = "top_k")]
     pub fn bottom_k_by<K: Into<Expr>, E: AsRef<[IE]>, IE: Into<Expr> + Clone>(
         self,
@@ -652,6 +669,16 @@ impl Expr {
     /// Shift the values in the array by some period and fill the resulting empty values.
     pub fn shift_and_fill<E: Into<Expr>, IE: Into<Expr>>(self, n: E, fill_value: IE) -> Self {
         self.map_ternary(FunctionExpr::ShiftAndFill, n.into(), fill_value.into())
+    }
+
+    /// Cumulatively count values from 0 to len.
+    #[cfg(feature = "cum_agg")]
+    pub fn cumulative_eval(self, evaluation: Expr, min_samples: usize) -> Self {
+        Expr::Eval {
+            expr: Arc::new(self),
+            evaluation: Arc::new(evaluation),
+            variant: EvalVariant::Cumulative { min_samples },
+        }
     }
 
     /// Cumulatively count values from 0 to len.

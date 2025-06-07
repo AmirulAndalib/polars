@@ -77,7 +77,9 @@ impl LazyFileListReader for LazyIpcReader {
                 pre_slice,
                 cast_columns_policy: CastColumnsPolicy::ERROR_ON_MISMATCH,
                 missing_columns_policy: MissingColumnsPolicy::Raise,
+                extra_columns_policy: ExtraColumnsPolicy::Raise,
                 include_file_paths,
+                deletion_files: Default::default(),
             },
         )?
         .build()

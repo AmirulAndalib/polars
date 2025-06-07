@@ -55,6 +55,7 @@ impl IntoMetadata for Metadata {
     any(feature = "serde", feature = "serde-lazy"),
     derive(Serialize, Deserialize)
 )]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub enum UnknownKind {
     // Hold the value to determine the concrete size.
     Int(i128),
@@ -82,6 +83,7 @@ impl UnknownKind {
     any(feature = "serde-lazy", feature = "serde"),
     derive(Serialize, Deserialize)
 )]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 #[strum(serialize_all = "snake_case")]
 pub enum CategoricalOrdering {
     #[default]
@@ -907,6 +909,9 @@ impl DataType {
             },
             #[cfg(feature = "dtype-struct")]
             (DataType::Struct(l), DataType::Struct(r)) => {
+                if l.len() != r.len() {
+                    polars_bail!(SchemaMismatch: "structs have different number of fields: {} vs {}", l.len(), r.len());
+                }
                 let mut must_cast = false;
                 for (l, r) in l.iter().zip(r.iter()) {
                     must_cast |= l.dtype.matches_schema_type(&r.dtype)?;
@@ -990,7 +995,7 @@ impl Display for DataType {
                 } else {
                     format_tuple!(dims)
                 };
-                return write!(f, "array[{tp}, {}]", shape);
+                return write!(f, "array[{tp}, {shape}]");
             },
             DataType::List(tp) => return write!(f, "list[{tp}]"),
             #[cfg(feature = "object")]
@@ -1112,6 +1117,7 @@ pub fn create_enum_dtype(categories: Utf8ViewArray) -> DataType {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub struct CompatLevel(pub(crate) u16);
 
 impl CompatLevel {

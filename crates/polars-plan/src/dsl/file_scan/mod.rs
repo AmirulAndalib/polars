@@ -1,6 +1,7 @@
 use std::hash::Hash;
 use std::sync::Mutex;
 
+use deletion::DeletionFilesList;
 use polars_core::utils::get_numeric_upcast_supertype_lossless;
 use polars_io::cloud::CloudOptions;
 #[cfg(feature = "csv")]
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use strum_macros::IntoStaticStr;
 
 use super::*;
+pub mod deletion;
 
 #[cfg(feature = "python")]
 pub mod python_dataset;
@@ -33,6 +35,7 @@ bitflags::bitflags! {
 
 #[derive(Clone, Debug, IntoStaticStr)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 // TODO: Arc<> some of the options and the cloud options.
 pub enum FileScan {
     #[cfg(feature = "csv")]
@@ -44,14 +47,14 @@ pub enum FileScan {
     #[cfg(feature = "parquet")]
     Parquet {
         options: ParquetOptions,
-        #[cfg_attr(feature = "serde", serde(skip))]
+        #[cfg_attr(any(feature = "serde", feature = "dsl-schema"), serde(skip))]
         metadata: Option<FileMetadataRef>,
     },
 
     #[cfg(feature = "ipc")]
     Ipc {
         options: IpcScanOptions,
-        #[cfg_attr(feature = "serde", serde(skip))]
+        #[cfg_attr(any(feature = "serde", feature = "dsl-schema"), serde(skip))]
         metadata: Option<Arc<arrow::io::ipc::read::FileMetadata>>,
     },
 
@@ -59,11 +62,11 @@ pub enum FileScan {
     PythonDataset {
         dataset_object: Arc<python_dataset::PythonDatasetProvider>,
 
-        #[cfg_attr(feature = "serde", serde(skip, default))]
+        #[cfg_attr(any(feature = "serde", feature = "dsl-schema"), serde(skip, default))]
         cached_ir: Arc<Mutex<Option<ExpandedDataset>>>,
     },
 
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(any(feature = "serde", feature = "dsl-schema"), serde(skip))]
     Anonymous {
         options: Arc<AnonymousScanOptions>,
         function: Arc<dyn AnonymousScan>,
@@ -117,6 +120,7 @@ impl FileScan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub enum MissingColumnsPolicy {
     #[default]
     Raise,
@@ -127,6 +131,7 @@ pub enum MissingColumnsPolicy {
 /// Used by scans.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub struct CastColumnsPolicy {
     /// Allow casting when target dtype is lossless supertype
     pub integer_upcast: bool,
@@ -139,6 +144,8 @@ pub struct CastColumnsPolicy {
     /// Allow datetime[ns] to be casted to any lower precision. Important for
     /// being able to read datasets written by spark.
     pub datetime_nanoseconds_downcast: bool,
+    /// Allow datetime[us] to datetime[ms]
+    pub datetime_microseconds_downcast: bool,
 
     /// Allow casting to change time units.
     pub datetime_convert_timezone: bool,
@@ -154,6 +161,7 @@ impl CastColumnsPolicy {
         float_upcast: false,
         float_downcast: false,
         datetime_nanoseconds_downcast: false,
+        datetime_microseconds_downcast: false,
         datetime_convert_timezone: false,
         missing_struct_fields: MissingColumnsPolicy::Raise,
         extra_struct_fields: ExtraColumnsPolicy::Raise,
@@ -168,6 +176,7 @@ impl Default for CastColumnsPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub enum ExtraColumnsPolicy {
     /// Error if there are extra columns outside the target schema.
     #[default]
@@ -176,8 +185,9 @@ pub enum ExtraColumnsPolicy {
 }
 
 /// Scan arguments shared across different scan types.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub struct UnifiedScanArgs {
     /// User-provided schema of the file. Will be inferred during IR conversion
     /// if None.
@@ -196,7 +206,31 @@ pub struct UnifiedScanArgs {
 
     pub cast_columns_policy: CastColumnsPolicy,
     pub missing_columns_policy: MissingColumnsPolicy,
+    pub extra_columns_policy: ExtraColumnsPolicy,
     pub include_file_paths: Option<PlSmallStr>,
+
+    pub deletion_files: Option<DeletionFilesList>,
+}
+
+impl Default for UnifiedScanArgs {
+    fn default() -> Self {
+        Self {
+            schema: None,
+            cloud_options: None,
+            hive_options: HiveOptions::new_enabled(),
+            rechunk: false,
+            cache: false,
+            glob: true,
+            projection: None,
+            row_index: None,
+            pre_slice: None,
+            cast_columns_policy: CastColumnsPolicy::default(),
+            missing_columns_policy: MissingColumnsPolicy::default(),
+            extra_columns_policy: ExtraColumnsPolicy::default(),
+            include_file_paths: None,
+            deletion_files: None,
+        }
+    }
 }
 
 /// Manual impls of Eq/Hash, as some fields are `Arc<T>` where T does not have Eq/Hash. For these
@@ -308,6 +342,8 @@ mod _file_scan_eq_hash {
 }
 
 impl CastColumnsPolicy {
+    /// Checks if casting can be done to a dtype with a configured policy.
+    ///
     /// # Returns
     /// * Ok(true): Cast needed to target dtype
     /// * Ok(false): No casting needed
@@ -405,7 +441,8 @@ impl CastColumnsPolicy {
                         ExtraColumnsPolicy::Raise => {
                             return mismatch_err(&format!(
                                 "encountered extra struct field: {}, \
-                                hint: pass cast_options=pl.ScanCastOptions(extra_struct_fields='ignore')",
+                                hint: specify this field in the schema, or pass \
+                                cast_options=pl.ScanCastOptions(extra_struct_fields='ignore')",
                                 &fld.name,
                             ));
                         },
@@ -441,9 +478,24 @@ impl CastColumnsPolicy {
 
         debug_assert!(!target_dtype.is_nested());
 
+        // Note: Only call this with non-nested types for performance
+        let materialize_unknown = |dtype: &DataType| -> std::borrow::Cow<DataType> {
+            dtype
+                .clone()
+                .materialize_unknown(true)
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(incoming_dtype))
+        };
+
+        let incoming_dtype = materialize_unknown(incoming_dtype);
+        let target_dtype = materialize_unknown(target_dtype);
+
         if target_dtype == incoming_dtype {
             return Ok(false);
         }
+
+        let incoming_dtype = incoming_dtype.as_ref();
+        let target_dtype = target_dtype.as_ref();
 
         //
         // After this point the dtypes are mismatching.
@@ -504,17 +556,29 @@ impl CastColumnsPolicy {
 
             // Check unit
             if target_unit != incoming_unit {
-                return if let TimeUnit::Nanoseconds = incoming_unit {
-                    if self.datetime_nanoseconds_downcast {
-                        Ok(true)
-                    } else {
-                        mismatch_err(
-                            "hint: pass cast_options=pl.ScanCastOptions(datetime_cast='nanosecond-downcast')",
-                        )
-                    }
-                } else {
-                    // Currently don't have parameter for controlling arbitrary time unit casting.
-                    mismatch_err("")
+                return match (incoming_unit, target_unit) {
+                    (TimeUnit::Nanoseconds, _) => {
+                        if self.datetime_nanoseconds_downcast {
+                            Ok(true)
+                        } else {
+                            mismatch_err(
+                                "hint: pass cast_options=pl.ScanCastOptions(datetime_cast='nanosecond-downcast')",
+                            )
+                        }
+                    },
+
+                    (TimeUnit::Microseconds, TimeUnit::Milliseconds) => {
+                        if self.datetime_microseconds_downcast {
+                            Ok(true)
+                        } else {
+                            // TODO
+                            mismatch_err(
+                                "unimplemented: 'microsecond-downcast' in scan cast options",
+                            )
+                        }
+                    },
+
+                    _ => mismatch_err(""),
                 };
             }
 

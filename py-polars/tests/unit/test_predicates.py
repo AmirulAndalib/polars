@@ -1,14 +1,20 @@
+from __future__ import annotations
+
 import re
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 
 import polars as pl
 from polars.exceptions import ComputeError, InvalidOperationError
+from polars.io.plugins import register_io_source
 from polars.testing import assert_frame_equal
 from polars.testing.asserts.series import assert_series_equal
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 def test_predicate_4906() -> None:
@@ -766,7 +772,7 @@ def test_predicate_pushdown_lazy_rename_22373(
 
     # Ensure filter is pushed past rename
     plan = query.explain()
-    assert plan.index("FILTER") > plan.index("RENAME")
+    assert plan.index("FILTER") > plan.index("SELECT")
 
 
 @pytest.mark.parametrize(
@@ -1096,3 +1102,59 @@ def test_predicate_pass() -> None:
         .explain()
     )
     assert plan.index("FILTER") > plan.index("MARKER")
+
+
+def test_predicate_pushdown_auto_disable_strict() -> None:
+    # Test that type-coercion automatically switches strict cast to
+    # non-strict/overflowing for compatible types, allowing the predicate to be
+    # pushed.
+    lf = pl.LazyFrame(
+        {"column": "2025-01-01", "column_date": datetime(2025, 1, 1), "integer": 1},
+        schema={
+            "column": pl.String,
+            "column_date": pl.Datetime("ns"),
+            "integer": pl.Int64,
+        },
+    )
+
+    q = lf.with_columns(
+        MARKER=1,
+    ).filter(
+        pl.col("column_date").cast(pl.Datetime("us")) == pl.lit(datetime(2025, 1, 1)),
+        pl.col("integer") == 1,
+    )
+
+    plan = q.explain()
+    assert plan.index("FILTER") > plan.index("MARKER")
+
+    q = lf.with_columns(
+        MARKER=1,
+    ).filter(
+        pl.col("column_date").cast(pl.Datetime("us"), strict=False)
+        == pl.lit(datetime(2025, 1, 1)),
+        pl.col("integer").cast(pl.Int128, strict=True) == 1,
+    )
+
+    plan = q.explain()
+    assert plan.index("FILTER") > plan.index("MARKER")
+
+
+def test_predicate_pushdown_map_elements_io_plugin_22860() -> None:
+    def generator(
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
+    ) -> Iterator[pl.DataFrame]:
+        df = pl.DataFrame({"row_nr": [1, 2, 3, 4, 5], "y": [0, 1, 0, 1, 1]})
+        assert predicate is not None
+        yield df.filter(predicate)
+
+    q = register_io_source(
+        io_source=generator, schema={"x": pl.Int64, "y": pl.Int64}
+    ).filter(pl.col("y").map_elements(bool))
+
+    plan = q.explain()
+    assert plan.index("map_list") > plan.index("PYTHON SCAN")
+
+    assert_frame_equal(q.collect(), pl.DataFrame({"row_nr": [2, 4, 5], "y": [1, 1, 1]}))

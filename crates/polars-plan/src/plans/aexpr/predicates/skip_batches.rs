@@ -186,7 +186,6 @@ fn aexpr_to_skip_batch_predicate_rec(
 
         match expr_arena.get(e) {
             AExpr::Explode { .. } => None,
-            AExpr::Alias(_, _) => None,
             AExpr::Column(_) => None,
             AExpr::Literal(_) => None,
             AExpr::BinaryExpr { left, op, right } => {
@@ -369,6 +368,7 @@ fn aexpr_to_skip_batch_predicate_rec(
             AExpr::Agg(..) => None,
             AExpr::Ternary { .. } => None,
             AExpr::AnonymousFunction { .. } => None,
+            AExpr::Eval { .. } => None,
             AExpr::Function {
                 input, function, ..
             } => match function {

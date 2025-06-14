@@ -92,7 +92,9 @@ impl LazyFileListReader for LazyParquetReader {
             } else {
                 MissingColumnsPolicy::Raise
             },
+            extra_columns_policy: ExtraColumnsPolicy::Raise,
             include_file_paths: self.args.include_file_paths,
+            deletion_files: Default::default(),
         };
 
         let mut lf: LazyFrame =

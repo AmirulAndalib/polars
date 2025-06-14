@@ -57,6 +57,15 @@ def test_cum_agg_with_nulls() -> None:
     assert_series_equal(s.cum_prod(), pl.Series("a", [None, 2, None, 14, 112, None]))
 
 
+def test_cum_agg_with_infs() -> None:
+    # confirm that inf values are handled correctly
+    s = pl.Series([float("inf"), 0.0, 1.0])
+    assert_series_equal(s.cum_min(), pl.Series([float("inf"), 0.0, 0.0]))
+
+    s = pl.Series([float("-inf"), 0.0, 1.0])
+    assert_series_equal(s.cum_max(), pl.Series([float("-inf"), 0.0, 1.0]))
+
+
 def test_cum_min_max_bool() -> None:
     s = pl.Series("a", [None, True, True, None, False, None, True, False, False, None])
     assert_series_equal(s.cum_min().cast(pl.Int32), s.cast(pl.Int32).cum_min())
@@ -1437,18 +1446,16 @@ def test_arg_sort() -> None:
         (pl.Series(["c", "b", "a"], dtype=pl.Categorical), 0, 2),
         (pl.Series([None, "c", "b", None, "a"], dtype=pl.Categorical), 1, 4),
         (pl.Series(["c", "b", "a"], dtype=pl.Categorical(ordering="lexical")), 2, 0),
-        (
-            pl.Series(
-                [None, "c", "b", None, "a"], dtype=pl.Categorical(ordering="lexical")
-            ),
-            4,
-            1,
-        ),
+        (pl.Series("s", [None, "c", "b", None, "a"], pl.Categorical("lexical")), 4, 1),
     ],
 )
 def test_arg_min_arg_max(series: pl.Series, argmin: int, argmax: int) -> None:
-    assert series.arg_min() == argmin
-    assert series.arg_max() == argmax
+    assert series.arg_min() == argmin, (
+        f"values: {series.to_list()}, expected {argmin} got {series.arg_min()}"
+    )
+    assert series.arg_max() == argmax, (
+        f"values: {series.to_list()}, expected {argmax} got {series.arg_max()}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -2216,7 +2223,6 @@ def test_construction_large_nested_u64_17231() -> None:
 
     values = [{"f0": [9223372036854775808]}]
     dtype = pl.Struct({"f0": pl.List(pl.UInt64)})
-
     assert pl.Series(values, dtype=dtype).to_list() == values
 
 

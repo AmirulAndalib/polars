@@ -382,11 +382,14 @@ impl SQLExprVisitor<'_> {
             if expr_dtype.is_none() && self.active_schema.is_none() {
                 right.clone()
             } else {
-                let left_dtype = expr_dtype.or_else(|| {
-                    self.active_schema
-                        .as_ref()
-                        .and_then(|schema| schema.get(&name))
-                });
+                let left_dtype = expr_dtype.map_or_else(
+                    || {
+                        self.active_schema
+                            .as_ref()
+                            .and_then(|schema| schema.get(&name))
+                    },
+                    |dt| dt.as_literal(),
+                );
                 match left_dtype {
                     Some(DataType::Time) if is_iso_time(s) => {
                         right.clone().str().to_time(StrptimeOptions {
@@ -403,7 +406,7 @@ impl SQLExprVisitor<'_> {
                     Some(DataType::Datetime(tu, tz)) if is_iso_datetime(s) || is_iso_date(s) => {
                         if s.len() == 10 {
                             // handle upcast from ISO date string (10 chars) to datetime
-                            lit(format!("{}T00:00:00", s))
+                            lit(format!("{s}T00:00:00"))
                         } else {
                             lit(s.replacen(' ', "T", 1))
                         }
@@ -470,14 +473,14 @@ impl SQLExprVisitor<'_> {
                 return Ok(self
                     .visit_expr(left)?
                     .dt()
-                    .offset_by(lit(format!("-{}", duration))));
+                    .offset_by(lit(format!("-{duration}"))));
             },
             (_, SQLBinaryOperator::Plus, SQLExpr::Interval(v)) => {
                 let duration = interval_to_duration(v, false)?;
                 return Ok(self
                     .visit_expr(left)?
                     .dt()
-                    .offset_by(lit(format!("{}", duration))));
+                    .offset_by(lit(format!("{duration}"))));
             },
             (SQLExpr::Interval(v1), _, SQLExpr::Interval(v2)) => {
                 // shortcut interval comparison evaluation (-> bool)
@@ -545,14 +548,14 @@ impl SQLExprVisitor<'_> {
             SQLBinaryOperator::PGRegexIMatch => match rhs {  // "x ~* y"
                 Expr::Literal(ref lv) if lv.extract_str().is_some() => {
                     let pat = lv.extract_str().unwrap();
-                    lhs.str().contains(lit(format!("(?i){}", pat)), true)
+                    lhs.str().contains(lit(format!("(?i){pat}")), true)
                 },
                 _ => polars_bail!(SQLSyntax: "invalid pattern for '~*' operator: {:?}", rhs),
             },
             SQLBinaryOperator::PGRegexNotIMatch => match rhs {  // "x !~* y"
                 Expr::Literal(ref lv) if lv.extract_str().is_some() => {
                     let pat = lv.extract_str().unwrap();
-                    lhs.str().contains(lit(format!("(?i){}", pat)), true).not()
+                    lhs.str().contains(lit(format!("(?i){pat}")), true).not()
                 },
                 _ => {
                     polars_bail!(SQLSyntax: "invalid pattern for '!~*' operator: {:?}", rhs)
@@ -773,7 +776,7 @@ impl SQLExprVisitor<'_> {
 
         #[cfg(feature = "json")]
         if dtype == &SQLDataType::JSON {
-            return Ok(expr.str().json_decode(None, None));
+            return Ok(expr.str().json_decode(<Option<DataTypeExpr>>::None, None));
         }
         let polars_type = map_sql_dtype_to_polars(dtype)?;
         Ok(match cast_kind {

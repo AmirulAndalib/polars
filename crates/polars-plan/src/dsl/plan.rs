@@ -15,7 +15,7 @@ use super::*;
 //
 // Serialized DSL is compatible with a deserializer, if:
 // - the serialized Major version and the deserializer Major version are equal, and
-// - there are no unknown fields in the serialized DSL.
+// - the serialized Minor version is less than or equal to the deserializer Minor version.
 //
 // The following sections describe when to increment the version. If unsure, ask.
 //
@@ -48,10 +48,11 @@ use super::*;
 // - changing a name, type, or meaning of a field or an enum variant
 // - changing a default value of a field or a default enum variant
 // - restricting the range of allowed values a field can have
-pub static DSL_VERSION: (u16, u16) = (4, 1);
+pub static DSL_VERSION: (u16, u16) = (13, 0);
 static DSL_MAGIC_BYTES: &[u8] = b"DSL_VERSION";
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub enum DslPlan {
     #[cfg(feature = "python")]
     PythonScan {
@@ -65,7 +66,6 @@ pub enum DslPlan {
     /// Cache the input at this point in the LP
     Cache {
         input: Arc<DslPlan>,
-        id: usize,
     },
     Scan {
         sources: ScanSources,
@@ -76,7 +76,7 @@ pub enum DslPlan {
         /// Local use cases often repeatedly collect the same `LazyFrame` (e.g. in interactive notebook use-cases),
         /// so we cache the IR conversion here, as the path expansion can be quite slow (especially for cloud paths).
         /// We don't have the arena, as this is always a source node.
-        #[cfg_attr(feature = "serde", serde(skip))]
+        #[cfg_attr(any(feature = "serde", feature = "dsl-schema"), serde(skip))]
         cached_ir: Arc<Mutex<Option<IR>>>,
     },
     // we keep track of the projection and selection as it is cheaper to first project and then filter
@@ -98,7 +98,7 @@ pub enum DslPlan {
         aggs: Vec<Expr>,
         maintain_order: bool,
         options: Arc<GroupbyOptions>,
-        #[cfg_attr(feature = "serde", serde(skip))]
+        #[cfg_attr(any(feature = "serde", feature = "dsl-schema"), serde(skip))]
         apply: Option<(Arc<dyn DataFrameUdf>, SchemaRef)>,
     },
     /// Join operation
@@ -185,7 +185,7 @@ pub enum DslPlan {
         // Keep the original Dsl around as we need that for serialization.
         dsl: Arc<DslPlan>,
         version: u32,
-        #[cfg_attr(feature = "serde", serde(skip))]
+        #[cfg_attr(any(feature = "serde", feature = "dsl-schema"), serde(skip))]
         node: Option<Node>,
     },
 }
@@ -201,7 +201,7 @@ impl Clone for DslPlan {
             #[cfg(feature = "python")]
             Self::PythonScan { options } => Self::PythonScan { options: options.clone() },
             Self::Filter { input, predicate } => Self::Filter { input: input.clone(), predicate: predicate.clone() },
-            Self::Cache { input, id } => Self::Cache { input: input.clone(), id: id.clone() },
+            Self::Cache { input } => Self::Cache { input: input.clone() },
             Self::Scan { sources, file_info, unified_scan_args, scan_type, cached_ir } => Self::Scan { sources: sources.clone(), file_info: file_info.clone(), unified_scan_args: unified_scan_args.clone(), scan_type: scan_type.clone(), cached_ir: cached_ir.clone() },
             Self::DataFrameScan { df, schema, } => Self::DataFrameScan { df: df.clone(), schema: schema.clone(),  },
             Self::Select { expr, input, options } => Self::Select { expr: expr.clone(), input: input.clone(), options: options.clone() },
@@ -315,36 +315,75 @@ impl DslPlan {
             );
         }
 
-        let (dsl, unknown_fields) = pl_serialize::SerializeOptions::default().deserialize_from_reader_with_unknown_fields(reader).map_err(|e| {
-            // The DSL serialization is forward compatible if there are no unknown fields
-            if minor > MINOR {
-                // Convey that the failure might also be due to broken forward compatibility
-                polars_err!(ComputeError:
-                    "deserialization failed\n\ngiven DSL_VERSION: {major}.{minor} is higher than this Polars version which uses DSL_VERSION: {MAJOR}.{MINOR}\n{}\nerror: {e}",
-                    "either the input is malformed, or the plan requires functionality not supported in this Polars version"
-                )
-            } else {
-                polars_err!(ComputeError:
-                    "deserialization failed\n\nerror: {e}",
-                )
-            }
-        })?;
+        if minor > MINOR {
+            #[cfg(feature = "polars_cloud_server")]
+            {
+                // In cloud, we are more flexible and allow deserializing higher minor version,
+                // if there were no unknown fields encountered.
+                //
+                // This is not enabled outside of the cloud server, because it increases
+                // the size of the binary.
 
-        if !unknown_fields.is_empty() {
-            if minor > MINOR {
-                polars_bail!(ComputeError:
-                    "deserialization failed\n\ngiven DSL_VERSION: {major}.{minor} is higher than this Polars version which uses DSL_VERSION: {MAJOR}.{MINOR}\n{}\nencountered unknown fields: {:?}",
-                    "the plan requires functionality not supported in this Polars version",
-                    unknown_fields,
-                )
-            } else {
-                polars_bail!(ComputeError:
-                    "deserialization failed\n\ngiven DSL_VERSION: {major}.{minor} should be supported in this Polars version which uses DSL_VERSION: {MAJOR}.{MINOR}\nencountered unknown fields: {:?}",
-                    unknown_fields,
-                )
+                let (dsl, unknown_fields) = pl_serialize::SerializeOptions::default().deserialize_from_reader_with_unknown_fields(reader).map_err(|e| {
+                    // Convey that the failure might also be due to broken forward compatibility
+                    polars_err!(ComputeError:
+                        "deserialization failed\n\ngiven DSL_VERSION: {major}.{minor} is higher than this Polars version which uses DSL_VERSION: {MAJOR}.{MINOR}\n{}\nerror: {e}",
+                        "either the input is malformed, or the plan requires functionality not supported in this Polars version"
+                    )
+                })?;
+                if !unknown_fields.is_empty() {
+                    polars_bail!(ComputeError:
+                        "deserialization failed\n\ngiven DSL_VERSION: {major}.{minor} is higher than this Polars version which uses DSL_VERSION: {MAJOR}.{MINOR}\n{}\nencountered unknown fields: {:?}",
+                        "the plan requires functionality not supported in this Polars version",
+                        unknown_fields,
+                    )
+                }
+                return Ok(dsl);
+            }
+
+            #[cfg(not(feature = "polars_cloud_server"))]
+            polars_bail!(ComputeError:
+                "deserialization failed\n\ngiven DSL_VERSION: {major}.{minor} is not compatible with this Polars version which uses DSL_VERSION: {MAJOR}.{MINOR}\n{}",
+                "error: can't deserialize DSL with a higher minor version"
+            );
+        }
+
+        pl_serialize::SerializeOptions::default()
+            .deserialize_from_reader::<_, _, true>(reader)
+            .map_err(|e| polars_err!(ComputeError: "deserialization failed\n\nerror: {e}"))
+    }
+
+    #[cfg(feature = "dsl-schema")]
+    pub fn dsl_schema() -> schemars::schema::RootSchema {
+        use schemars::r#gen::SchemaSettings;
+        use schemars::schema::SchemaObject;
+        use schemars::visit::{Visitor, visit_schema_object};
+
+        #[derive(Clone, Copy, Debug)]
+        struct MyVisitor;
+
+        impl Visitor for MyVisitor {
+            fn visit_schema_object(&mut self, schema: &mut SchemaObject) {
+                // Remove descriptions auto-generated from doc comments
+                if schema.metadata.is_some() {
+                    schema.metadata().description = None;
+                }
+
+                visit_schema_object(self, schema);
             }
         }
 
-        Ok(dsl)
+        let mut schema = SchemaSettings::default()
+            .with_visitor(MyVisitor)
+            .into_generator()
+            .into_root_schema_for::<DslPlan>();
+
+        // Add DSL version as a top level field
+        schema.schema.extensions.insert(
+            "version".into(),
+            format!("{}.{}", DSL_VERSION.0, DSL_VERSION.1).into(),
+        );
+
+        schema
     }
 }

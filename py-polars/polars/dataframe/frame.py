@@ -1399,6 +1399,99 @@ class DataFrame:
         key: str | Sequence[int] | Sequence[str] | tuple[Any, str | int],
         value: Any,
     ) -> None:  # pragma: no cover
+        """
+        Modify DataFrame elements in place, using assignment syntax.
+
+        Parameters
+        ----------
+        key : str | Sequence[int] | Sequence[str] | tuple[Any, str | int]
+            Specifies the location(s) within the DataFrame to assign new values.
+            The behavior varies based on the type of `key`:
+
+            - Str: `df["a"] = value`:
+                Not supported. Raises a `TypeError`. Use `df.with_columns(...)`
+                to add or modify columns.
+
+            - Sequence[str]: `df[["a", "b"]] = value`:
+                Assigns multiple columns at once. `value` must be a 2D array-like
+                structure with the same number of columns as the list
+                of column names provided.
+
+            - tuple[Any, str | int]: `df[row_idx, "a"] = value`:
+                Assigns a new value to a specific element in the DataFrame, where
+                `row_idx` specifies the row and `"a"` specifies the column.
+
+            - `df[row_idx, col_idx] = value`:
+                Similar to the above, but `col_idx` is the integer index of the column.
+
+        value : Any
+            The new value(s) to assign. The expected structure of `value` depends on the
+            form of `key`:
+
+            - For multiple column assignment (`df[["a", "b"]] = value`), `value` should
+              be a 2D array-like object with shape (n_rows, n_columns).
+
+            - For single element assignment (`df[row_idx, "a"] = value`), `value` should
+              be a scalar.
+
+        Raises
+        ------
+        TypeError
+            If an unsupported assignment is attempted, such as assigning a Series
+            directly to a column using `df["a"] = series`.
+
+        ValueError
+            If the shape of `value` does not match the expected shape based on `key`.
+
+        Examples
+        --------
+        Sequence[str] :  `df[["a", "b"]] = value`:
+
+        >>> import numpy as np
+        >>> df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        >>> df[["a", "b"]] = np.array([[10, 40], [20, 50], [30, 60]])
+        >>> df
+        shape: (3, 2)
+        ┌─────┬─────┐
+        │ a   ┆ b   │
+        │ --- ┆ --- │
+        │ i64 ┆ i64 │
+        ╞═════╪═════╡
+        │ 10  ┆ 40  │
+        │ 20  ┆ 50  │
+        │ 30  ┆ 60  │
+        └─────┴─────┘
+
+        tuple[Any, str | int] : `df[row_idx, "a"] = value`:
+
+        >>> df[1, "a"] = 100
+        >>> df
+        shape: (3, 2)
+        ┌─────┬─────┐
+        │ a   ┆ b   │
+        │ --- ┆ --- │
+        │ i64 ┆ i64 │
+        ╞═════╪═════╡
+        │ 10  ┆ 40  │
+        │ 100 ┆ 50  │
+        │ 30  ┆ 60  │
+        └─────┴─────┘
+
+        `df[row_idx, col_idx] = value`:
+
+        >>> df[0, 1] = 30
+        >>> df
+        shape: (3, 2)
+        ┌─────┬─────┐
+        │ a   ┆ b   │
+        │ --- ┆ --- │
+        │ i64 ┆ i64 │
+        ╞═════╪═════╡
+        │ 10  ┆ 30  │
+        │ 100 ┆ 50  │
+        │ 30  ┆ 60  │
+        └─────┴─────┘
+        """
         # df["foo"] = series
         if isinstance(key, str):
             msg = (
@@ -2768,7 +2861,7 @@ class DataFrame:
         should_return_buffer = False
         target: str | Path | IO[bytes] | IO[str]
         if file is None:
-            target = cast(IO[bytes], BytesIO())
+            target = cast("IO[bytes]", BytesIO())
             should_return_buffer = True
         elif isinstance(file, (str, os.PathLike)):
             target = normalize_filepath(file)
@@ -2966,18 +3059,12 @@ class DataFrame:
         should_return_buffer = False
         target: str | Path | IO[bytes] | IO[str]
         if file is None:
-            target = cast(IO[bytes], BytesIO())
+            target = cast("IO[bytes]", BytesIO())
             should_return_buffer = True
         elif isinstance(file, (str, os.PathLike)):
             target = normalize_filepath(file)
         else:
             target = file
-
-        if storage_options:
-            storage_options = list(storage_options.items())  # type: ignore[assignment]
-        else:
-            # Handle empty dict input
-            storage_options = None
 
         engine: EngineType = "in-memory"
 
@@ -4537,17 +4624,11 @@ class DataFrame:
         _check_if_delta_available()
 
         from deltalake import DeltaTable, write_deltalake
-        from deltalake import __version__ as delta_version
 
         _check_for_unsupported_types(self.dtypes)
 
         if isinstance(target, (str, Path)):
             target = _resolve_delta_lake_uri(str(target), strict=False)
-
-        if parse_version(delta_version) >= (0, 23, 0):
-            data = self.to_arrow(compat_level=CompatLevel.newest())
-        else:
-            data = self.to_arrow()
 
         from polars.io.cloud.credential_provider._builder import (
             _init_credential_provider_builder,
@@ -4573,8 +4654,8 @@ class DataFrame:
         if credential_provider_builder and (
             provider := credential_provider_builder.build_credential_provider()
         ):
-            credential_provider_creds = _get_credentials_from_provider_expiry_aware(
-                provider
+            credential_provider_creds = (
+                _get_credentials_from_provider_expiry_aware(provider) or {}
             )
 
         # We aren't calling into polars-native write functions so we just update
@@ -4594,7 +4675,7 @@ class DataFrame:
             else:
                 dt = target
 
-            return dt.merge(data, **delta_merge_options)
+            return dt.merge(self, **delta_merge_options)
 
         else:
             if delta_write_options is None:
@@ -4603,11 +4684,9 @@ class DataFrame:
             if overwrite_schema:
                 delta_write_options["schema_mode"] = "overwrite"
 
-            schema = delta_write_options.pop("schema", None)
             write_deltalake(
                 table_or_uri=target,
-                data=data,
-                schema=schema,
+                data=self,
                 mode=mode,
                 storage_options=storage_options,
                 **delta_write_options,
@@ -6954,7 +7033,7 @@ class DataFrame:
            - 1y    (1 calendar year)
            - 1i    (1 index count)
 
-           Or combine them:
+           Or combine them (except in `every`):
            "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
 
            By "calendar day", we mean the corresponding time on the next day (which may

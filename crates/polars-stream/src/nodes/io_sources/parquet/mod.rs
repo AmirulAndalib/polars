@@ -174,11 +174,10 @@ impl FileReader for ParquetFileReader {
             if verbose {
                 eprintln!(
                     "[ParquetFileReader]: early return: \
-                    n_rows_in_file: {} \
-                    pre_slice: {:?} \
-                    resolved_pre_slice: {:?} \
-                    ",
-                    n_rows_in_file, pre_slice_arg, normalized_pre_slice
+                    n_rows_in_file: {n_rows_in_file} \
+                    pre_slice: {pre_slice_arg:?} \
+                    resolved_pre_slice: {normalized_pre_slice:?} \
+                    "
                 )
             }
 
@@ -280,6 +279,10 @@ impl FileReader for ParquetFileReader {
 
     async fn n_rows_in_file(&mut self) -> PolarsResult<IdxSize> {
         self._n_rows_in_file()
+    }
+
+    async fn fast_n_rows_in_file(&mut self) -> PolarsResult<Option<IdxSize>> {
+        self._n_rows_in_file().map(Some)
     }
 
     async fn row_position_after_slice(

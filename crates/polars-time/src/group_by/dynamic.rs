@@ -18,6 +18,7 @@ struct Wrap<T>(pub T);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub struct DynamicGroupOptions {
     /// Time or index column.
     pub index_column: PlSmallStr,
@@ -52,6 +53,7 @@ impl Default for DynamicGroupOptions {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub struct RollingGroupOptions {
     /// Time or index column.
     pub index_column: PlSmallStr,
@@ -319,7 +321,7 @@ impl Wrap<&DataFrame> {
                 include_lower_bound,
                 include_upper_bound,
                 options.start_by,
-            );
+            )?;
             update_bounds(lower, upper);
             PolarsResult::Ok(GroupsType::Slice {
                 groups,
@@ -347,7 +349,7 @@ impl Wrap<&DataFrame> {
                     include_lower_bound,
                     include_upper_bound,
                     options.start_by,
-                );
+                )?;
 
                 PolarsResult::Ok((
                     groups

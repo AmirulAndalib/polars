@@ -15,6 +15,7 @@ use polars::frame::row::Row;
 use polars::io::avro::AvroCompression;
 #[cfg(feature = "cloud")]
 use polars::io::cloud::CloudOptions;
+use polars::prelude::deletion::DeletionFilesList;
 use polars::series::ops::NullBehavior;
 use polars_core::utils::arrow::array::Array;
 use polars_core::utils::arrow::types::NativeType;
@@ -1212,8 +1213,12 @@ impl<'py> FromPyObject<'py> for Wrap<QuoteStyle> {
 }
 
 #[cfg(feature = "cloud")]
-pub(crate) fn parse_cloud_options(uri: &str, kv: Vec<(String, String)>) -> PyResult<CloudOptions> {
-    let out = CloudOptions::from_untyped_config(uri, kv).map_err(PyPolarsErr::from)?;
+pub(crate) fn parse_cloud_options(
+    uri: &str,
+    kv: impl IntoIterator<Item = (String, String)>,
+) -> PyResult<CloudOptions> {
+    let iter: &mut dyn Iterator<Item = _> = &mut kv.into_iter();
+    let out = CloudOptions::from_untyped_config(uri, iter).map_err(PyPolarsErr::from)?;
     Ok(out)
 }
 
@@ -1240,11 +1245,10 @@ impl<'py> FromPyObject<'py> for Wrap<CastColumnsPolicy> {
     fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
         if ob.is_none() {
             // Initialize the default ScanCastOptions from Python.
-
             static DEFAULT: GILOnceCell<Wrap<CastColumnsPolicy>> = GILOnceCell::new();
 
             let out = DEFAULT.get_or_try_init(ob.py(), || {
-                let ob = PyModule::import(ob.py(), "polars.io.cast_options")
+                let ob = PyModule::import(ob.py(), "polars.io.scan_options.cast_options")
                     .unwrap()
                     .getattr("ScanCastOptions")
                     .unwrap()
@@ -1262,13 +1266,17 @@ impl<'py> FromPyObject<'py> for Wrap<CastColumnsPolicy> {
             return Ok(out.clone());
         }
 
-        let integer_upcast = match &*ob.getattr("integer_cast")?.extract::<PyBackedStr>()? {
+        let py = ob.py();
+
+        let integer_upcast = match &*ob
+            .getattr(intern!(py, "integer_cast"))?
+            .extract::<PyBackedStr>()?
+        {
             "upcast" => true,
             "forbid" => false,
             v => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown option for integer_cast: {}",
-                    v
+                    "unknown option for integer_cast: {v}"
                 )));
             },
         };
@@ -1276,81 +1284,65 @@ impl<'py> FromPyObject<'py> for Wrap<CastColumnsPolicy> {
         let mut float_upcast = false;
         let mut float_downcast = false;
 
-        let mut parse_float_cast_option = |v: &str| -> PyResult<()> {
+        let float_cast_object = ob.getattr(intern!(py, "float_cast"))?;
+
+        parse_multiple_options("float_cast", float_cast_object, |v| {
             match v {
                 "forbid" => {},
                 "upcast" => float_upcast = true,
                 "downcast" => float_downcast = true,
                 v => {
                     return Err(PyValueError::new_err(format!(
-                        "unknown option for float_cast: {}",
-                        v
+                        "unknown option for float_cast: {v}"
                     )));
                 },
             }
 
             Ok(())
-        };
-
-        let float_cast_object = ob.getattr("float_cast")?;
-
-        parse_multiple_options(
-            "float_cast",
-            float_cast_object,
-            &mut parse_float_cast_option,
-        )?;
+        })?;
 
         let mut datetime_nanoseconds_downcast = false;
         let mut datetime_convert_timezone = false;
 
-        let mut parse_datetime_cast_option = |v: &str| -> PyResult<()> {
+        let datetime_cast_object = ob.getattr(intern!(py, "datetime_cast"))?;
+
+        parse_multiple_options("datetime_cast", datetime_cast_object, |v| {
             match v {
                 "forbid" => {},
                 "nanosecond-downcast" => datetime_nanoseconds_downcast = true,
                 "convert-timezone" => datetime_convert_timezone = true,
                 v => {
                     return Err(PyValueError::new_err(format!(
-                        "unknown option for datetime_cast: {}",
-                        v
+                        "unknown option for datetime_cast: {v}"
                     )));
                 },
             };
 
             Ok(())
-        };
-
-        let datetime_cast_object = ob.getattr("datetime_cast")?;
-
-        parse_multiple_options(
-            "datetime_cast",
-            datetime_cast_object,
-            &mut parse_datetime_cast_option,
-        )?;
+        })?;
 
         let missing_struct_fields = match &*ob
-            .getattr("missing_struct_fields")?
+            .getattr(intern!(py, "missing_struct_fields"))?
             .extract::<PyBackedStr>()?
         {
             "insert" => MissingColumnsPolicy::Insert,
             "raise" => MissingColumnsPolicy::Raise,
             v => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown option for missing_struct_fields: {}",
-                    v
+                    "unknown option for missing_struct_fields: {v}"
                 )));
             },
         };
 
         let extra_struct_fields = match &*ob
-            .getattr("extra_struct_fields")?
+            .getattr(intern!(py, "extra_struct_fields"))?
             .extract::<PyBackedStr>()?
         {
             "ignore" => ExtraColumnsPolicy::Ignore,
             "raise" => ExtraColumnsPolicy::Raise,
             v => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown option for extra_struct_fields: {}",
-                    v
+                    "unknown option for extra_struct_fields: {v}"
                 )));
             },
         };
@@ -1360,15 +1352,16 @@ impl<'py> FromPyObject<'py> for Wrap<CastColumnsPolicy> {
             float_upcast,
             float_downcast,
             datetime_nanoseconds_downcast,
+            datetime_microseconds_downcast: false,
             datetime_convert_timezone,
             missing_struct_fields,
             extra_struct_fields,
         }));
 
-        fn parse_multiple_options<'a>(
+        fn parse_multiple_options(
             parameter_name: &'static str,
-            py_object: Bound<'a, PyAny>,
-            parser_func: &mut dyn FnMut(&str) -> PyResult<()>,
+            py_object: Bound<'_, PyAny>,
+            mut parser_func: impl FnMut(&str) -> PyResult<()>,
         ) -> PyResult<()> {
             if let Ok(v) = py_object.extract::<PyBackedStr>() {
                 parser_func(&v)?;
@@ -1378,8 +1371,7 @@ impl<'py> FromPyObject<'py> for Wrap<CastColumnsPolicy> {
                 }
             } else {
                 return Err(PyValueError::new_err(format!(
-                    "unknown type for {}: {}",
-                    parameter_name, py_object
+                    "unknown type for {parameter_name}: {py_object}"
                 )));
             }
 
@@ -1594,5 +1586,49 @@ impl<'py> FromPyObject<'py> for Wrap<MissingColumnsPolicyOrExpr> {
             },
         };
         Ok(Wrap(parsed))
+    }
+}
+
+impl<'py> FromPyObject<'py> for Wrap<DeletionFilesList> {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let (deletion_file_type, ob): (PyBackedStr, Bound<'_, PyAny>) = ob.extract()?;
+
+        Ok(Wrap(match &*deletion_file_type {
+            "iceberg-position-delete" => {
+                let dict: Bound<'_, PyDict> = ob.extract()?;
+
+                let mut out = PlIndexMap::new();
+
+                for (k, v) in dict
+                    .try_iter()?
+                    .zip(dict.call_method0("values")?.try_iter()?)
+                {
+                    let k: usize = k?.extract()?;
+                    let v: Bound<'_, PyAny> = v?.extract()?;
+
+                    let files = v
+                        .try_iter()?
+                        .map(|x| {
+                            x.and_then(|x| {
+                                let x: String = x.extract()?;
+                                Ok(x)
+                            })
+                        })
+                        .collect::<PyResult<Arc<[String]>>>()?;
+
+                    if !files.is_empty() {
+                        out.insert(k, files);
+                    }
+                }
+
+                DeletionFilesList::IcebergPositionDelete(Arc::new(out))
+            },
+
+            v => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown deletion file type: {v}"
+                )));
+            },
+        }))
     }
 }
